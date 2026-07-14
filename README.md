@@ -44,6 +44,20 @@ python scripts/train.py --dataset private_work\dataset\training.zip --execute
 6. Run exact-speech testing as a separate audio/lip-sync evaluation.
 7. Publish sanitized quality, latency, and cost evidence.
 
+## Budget-capped inference
+
+The generation runner supports distilled text-to-video, image-to-video, base comparisons, and audio-driven LoRA tests. Uploaded private assets are cached by SHA-256 outside Git, provider request IDs are persisted before log streaming, and every paid request is reserved in the same USD 12 ledger.
+
+```powershell
+python scripts/generate.py `
+  --name studio-smoke `
+  --mode t2v-lora `
+  --prompt "chrx9_person speaking to camera in a professional studio" `
+  --lora-file private_work\adapter.safetensors
+```
+
+This is a dry run. Add `--execute` only after the projected request cost and remaining ledger budget have been reviewed.
+
 See [docs/TEST_PLAN.md](docs/TEST_PLAN.md) for acceptance criteria.
 
 ## Manual selection file
