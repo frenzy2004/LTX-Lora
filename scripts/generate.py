@@ -10,7 +10,7 @@ from pathlib import Path
 
 from ltx_lora_pilot.budget import BudgetLedger, estimate_inference_cost
 from ltx_lora_pilot.fal_api import submit, upload
-from ltx_lora_pilot.generation import build_generation_request, resolve_uploaded_asset
+from ltx_lora_pilot.generation import build_generation_request, resolve_uploaded_asset, validate_audio_input
 
 
 def main() -> None:
@@ -67,6 +67,7 @@ def main() -> None:
     if args.mode == "a2v-lora":
         if not args.audio:
             raise ValueError("audio-to-video mode requires --audio")
+        validate_audio_input(args.audio)
         audio_url = resolve_uploaded_asset(args.audio, args.asset_cache, upload)
 
     endpoint, payload = build_generation_request(

@@ -20,6 +20,15 @@ NEGATIVE_PROMPT = (
     "different person, multiple people, duplicate person, distorted face, deformed facial features, "
     "asymmetrical eyes, bad hands, extra fingers, jitter, flicker, camera shake, text, subtitles, watermark, logo"
 )
+SUPPORTED_AUDIO_SUFFIXES = {".wav", ".mp3", ".aiff", ".aif", ".aac", ".ogg", ".flac", ".m4a"}
+
+
+def validate_audio_input(path: Path) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if path.suffix.lower() not in SUPPORTED_AUDIO_SUFFIXES:
+        supported = ", ".join(sorted(SUPPORTED_AUDIO_SUFFIXES))
+        raise ValueError(f"Unsupported audio format: {path.suffix or '<none>'}. Supported formats: {supported}")
 
 
 def build_generation_request(

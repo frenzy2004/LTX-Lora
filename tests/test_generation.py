@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from ltx_lora_pilot.generation import build_generation_request, resolve_uploaded_asset
+from ltx_lora_pilot.generation import build_generation_request, resolve_uploaded_asset, validate_audio_input
 
 
 def test_build_t2v_lora_request() -> None:
@@ -48,6 +48,21 @@ def test_build_a2v_request_requires_audio() -> None:
             lora_url="https://private.invalid/adapter.safetensors",
             image_url="https://private.invalid/reference.png",
         )
+
+
+def test_validate_audio_input_rejects_video_container(tmp_path: Path) -> None:
+    source = tmp_path / "voice.mp4"
+    source.write_bytes(b"placeholder")
+
+    with pytest.raises(ValueError, match="Unsupported audio format"):
+        validate_audio_input(source)
+
+
+def test_validate_audio_input_accepts_wav(tmp_path: Path) -> None:
+    source = tmp_path / "voice.wav"
+    source.write_bytes(b"placeholder")
+
+    validate_audio_input(source)
 
 
 def test_resolve_uploaded_asset_reuses_private_cache(tmp_path: Path) -> None:

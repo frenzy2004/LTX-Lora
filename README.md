@@ -66,6 +66,7 @@ The first two fal generations are published under [`results/videos`](results/vid
 
 - `t2v-lora-prompt-only-identity-failure.mp4` documents that the 500-step adapter is not sufficient for prompt-only identity generation.
 - `i2v-lora-reference-conditioned.mp4` shows substantially stronger identity preservation when the same adapter is combined with an approved first-frame reference.
+- `a2v-lora-supplied-audio.mp4` tests an 11-second approved voice recording with the same first frame and adapter.
 
 See [`results/EVALUATION.md`](results/EVALUATION.md) for the sanitized test record and current cost ledger.
 
