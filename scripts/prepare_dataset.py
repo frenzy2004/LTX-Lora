@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from ltx_lora_pilot.dataset import safe_reset_output_directory
+from ltx_lora_pilot.dataset import portrait_video_filter, safe_reset_output_directory, select_records
 
 
 TRIGGER = "chrx9_person"
@@ -29,7 +29,7 @@ def normalize(source: Path, destination: Path, start: float, duration: float) ->
         "0:v:0",
         "-an",
         "-vf",
-        "fps=24,scale='min(1280,iw)':-2",
+        portrait_video_filter(),
         "-c:v",
         "libx264",
         "-preset",
@@ -49,6 +49,7 @@ def normalize(source: Path, destination: Path, start: float, duration: float) ->
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a neutral video-only fal training archive")
     parser.add_argument("--inventory", type=Path, required=True)
+    parser.add_argument("--selection", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--train-count", type=int, default=30)
     parser.add_argument("--holdout-count", type=int, default=5)
@@ -56,15 +57,34 @@ def main() -> None:
     args = parser.parse_args()
 
     records = json.loads(args.inventory.read_text(encoding="utf-8"))
-    eligible = [record for record in records if record["duration"] >= args.clip_seconds and min(record["width"], record["height"]) >= 480]
-    eligible.sort(key=lambda record: (-min(record["width"], record["height"]), -record["duration"], record["source_id"]))
-    needed = args.train_count + args.holdout_count
-    if len(eligible) < needed:
-        raise RuntimeError(f"need {needed} eligible sources, found {len(eligible)}")
-
-    chosen = eligible[:needed]
-    training = chosen[: args.train_count]
-    holdout = chosen[args.train_count :]
+    if args.selection:
+        selection = json.loads(args.selection.read_text(encoding="utf-8"))
+        training, holdout = select_records(
+            records,
+            selection["training_source_ids"],
+            selection["holdout_source_ids"],
+            clip_seconds=args.clip_seconds,
+        )
+        if len(training) != args.train_count or len(holdout) != args.holdout_count:
+            raise ValueError(
+                f"selection has {len(training)} training and {len(holdout)} holdout sources; "
+                f"expected {args.train_count} and {args.holdout_count}"
+            )
+    else:
+        eligible = [
+            record
+            for record in records
+            if record["duration"] >= args.clip_seconds and min(record["width"], record["height"]) >= 480
+        ]
+        eligible.sort(
+            key=lambda record: (-min(record["width"], record["height"]), -record["duration"], record["source_id"])
+        )
+        needed = args.train_count + args.holdout_count
+        if len(eligible) < needed:
+            raise RuntimeError(f"need {needed} eligible sources, found {len(eligible)}")
+        chosen = eligible[:needed]
+        training = chosen[: args.train_count]
+        holdout = chosen[args.train_count :]
     train_dir = args.output / "training"
     holdout_dir = args.output / "holdout"
     for directory in (train_dir, holdout_dir):

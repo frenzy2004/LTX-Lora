@@ -12,6 +12,8 @@ Determine whether a private LTX 2.3 LoRA materially improves character consisten
 - No captions, watermarks, rapid edits, or heavy beauty filters.
 - Five source clips held out from training.
 - Video-only fal archive with matching `.txt` caption sidecars.
+- Landscape containers with centered portrait content are cropped to true 9:16 before training.
+- Sidecar captions describe clothing, pose, and environment; the configured trigger phrase is prepended by fal.
 
 ## Fixed location matrix
 
