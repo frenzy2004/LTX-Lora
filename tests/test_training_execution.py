@@ -49,3 +49,28 @@ def test_submit_failure_keeps_conservative_charge(tmp_path: Path) -> None:
         )
 
     assert ledger.remaining() == Decimal("10.8000")
+
+
+def test_training_forwards_enqueue_callback(tmp_path: Path) -> None:
+    ledger = BudgetLedger(tmp_path / "budget.json")
+    captured = []
+
+    def submit_success(_endpoint, _payload, *, on_update, on_enqueue):
+        assert on_update is None
+        on_enqueue("request-123")
+        return {"ok": True}
+
+    run_training(
+        ledger=ledger,
+        projected_cost=Decimal("1.20"),
+        label="smoke",
+        dataset=tmp_path / "dataset.zip",
+        endpoint="test-endpoint",
+        payload={},
+        output=tmp_path / "result.json",
+        upload_fn=lambda _path: "https://private.invalid/dataset.zip",
+        submit_fn=submit_success,
+        on_enqueue=captured.append,
+    )
+
+    assert captured == ["request-123"]

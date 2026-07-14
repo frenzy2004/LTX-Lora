@@ -7,6 +7,7 @@ Reproducible tooling for a privacy-preserving, budget-capped LTX 2.3 character-L
 - Private images, videos, audio, trained weights, provider URLs, and secrets stay outside Git.
 - All provider actions are dry-run unless `--execute` is supplied.
 - Paid actions reserve projected cost in a local atomic ledger before submission.
+- Paid jobs persist their provider request ID before log streaming so interrupted clients can recover results without resubmitting.
 - The default pilot budget is **USD 12.00** and cannot be raised unless `ALLOW_BUDGET_OVERRIDE=1` is set explicitly.
 - Dataset archives contain videos only; reference images are used only for validation and inference.
 - The pilot uses a neutral trigger phrase and contains no personal names or chat material.

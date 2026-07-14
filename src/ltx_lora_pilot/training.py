@@ -24,6 +24,7 @@ def run_training(
     upload_fn: UploadFunction,
     submit_fn: SubmitFunction,
     on_update: Callable[[Any], None] | None = None,
+    on_enqueue: Callable[[str], None] | None = None,
 ) -> Any:
     reservation = ledger.reserve(projected_cost, label)
     reached_submit_boundary = False
@@ -31,7 +32,7 @@ def run_training(
         request_payload = dict(payload)
         request_payload["training_data_url"] = upload_fn(dataset)
         reached_submit_boundary = True
-        result = submit_fn(endpoint, request_payload, on_update=on_update)
+        result = submit_fn(endpoint, request_payload, on_update=on_update, on_enqueue=on_enqueue)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         return result

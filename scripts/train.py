@@ -6,7 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from ltx_lora_pilot.budget import BudgetLedger, estimate_training_cost
-from ltx_lora_pilot.fal_api import submit, upload
+from ltx_lora_pilot.fal_api import safe_console_text, submit, upload
 from ltx_lora_pilot.training import run_training
 
 
@@ -47,6 +47,16 @@ def main() -> None:
     if not args.dataset.is_file():
         raise FileNotFoundError(args.dataset)
 
+    request_state = args.output.with_suffix(".request.json")
+
+    def record_request_id(request_id: str) -> None:
+        request_state.parent.mkdir(parents=True, exist_ok=True)
+        request_state.write_text(
+            json.dumps({"endpoint": ENDPOINT, "request_id": request_id}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"request state written to {request_state}")
+
     run_training(
         ledger=ledger,
         projected_cost=projected,
@@ -57,7 +67,8 @@ def main() -> None:
         output=args.output,
         upload_fn=upload,
         submit_fn=submit,
-        on_update=lambda event: print(event),
+        on_update=lambda event: print(safe_console_text(event)),
+        on_enqueue=record_request_id,
     )
     print(f"training result written to {args.output}")
 
