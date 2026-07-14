@@ -699,11 +699,11 @@ Run:
 
 ```powershell
 python -m pytest -q
+python -m pytest -q tests/test_privacy.py
 git diff --check
-rg -n -i "(fal[_-]?key|drive\.google\.com|api[_-]?key|bearer\s+|signed[_-]?url|request[_-]?id|C:\\Users\\)" -- . ':!docs/superpowers/specs/2026-07-15-fal-a2v-execution-bundle-design.md'
 ```
 
-Expected: all tests pass, `git diff --check` has no output, and the privacy scan has no sensitive hits. Any intentional documentation vocabulary hit must be represented as an allowlisted literal in `tests/test_privacy.py`, never silently ignored.
+Expected: all tests pass and `git diff --check` has no output. `tests/test_privacy.py` scans tracked repository content for actual secret values, private identifiers, and private paths while allowing documentation to name environment variables and security concepts without creating false positives. Any new intentional vocabulary exception must be a narrow allowlisted literal in that test, never a broad ignored path.
 
 - [ ] **Step 6: Commit and push the sanitized implementation**
 
