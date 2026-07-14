@@ -1,0 +1,21 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Private media, provider artifacts, and local execution state must never be committed.
+private_inputs/
+private_work/
+.pilot_state/
+outputs/
+*.safetensors
+*.mp4
+*.mov
+*.wav
+*.zip

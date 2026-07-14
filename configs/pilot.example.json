@@ -1,0 +1,26 @@
+{
+  "budget_usd": "12.00",
+  "trigger_phrase": "chrx9_person",
+  "training": {
+    "endpoint": "fal-ai/ltx23-trainer-v2/i2v",
+    "rank": 32,
+    "number_of_steps": 500,
+    "learning_rate": 0.0002,
+    "first_frame_conditioning_p": 0.5,
+    "number_of_frames": 89,
+    "frame_rate": 24,
+    "resolution": "medium",
+    "aspect_ratio": "9:16",
+    "auto_scale_input": true,
+    "split_input_into_scenes": false,
+    "with_audio": false
+  },
+  "inference": {
+    "preview_endpoint": "fal-ai/ltx-2.3-22b/distilled/image-to-video/lora",
+    "final_endpoint": "fal-ai/ltx-2.3-22b/image-to-video/lora",
+    "width": 720,
+    "height": 1280,
+    "num_frames": 121,
+    "fps": 24
+  }
+}
