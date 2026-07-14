@@ -3,6 +3,7 @@ import re
 
 
 PRIVATE_DIRECTORY_NAMES = {"private_inputs", "private_work", ".pilot_state", "outputs"}
+PUBLIC_GENERATED_MEDIA_ROOT = Path("results/videos")
 PRIVATE_MEDIA_SUFFIXES = {
     ".aac",
     ".avi",
@@ -32,7 +33,10 @@ def test_repository_has_no_private_artifacts() -> None:
             continue
         if any(part in PRIVATE_DIRECTORY_NAMES for part in relative.parts):
             violations.append(str(relative))
-        if path.suffix.lower() in PRIVATE_MEDIA_SUFFIXES:
+        is_approved_generated_clip = (
+            relative.parent == PUBLIC_GENERATED_MEDIA_ROOT and path.suffix.lower() == ".mp4"
+        )
+        if path.suffix.lower() in PRIVATE_MEDIA_SUFFIXES and not is_approved_generated_clip:
             violations.append(str(relative))
     assert not violations, f"private artifacts found in: {violations}"
 

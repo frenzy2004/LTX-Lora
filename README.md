@@ -4,7 +4,7 @@ Reproducible tooling for a privacy-preserving, budget-capped LTX 2.3 character-L
 
 ## Safety boundaries
 
-- Private images, videos, audio, trained weights, provider URLs, and secrets stay outside Git.
+- Private source images, source videos, source audio, trained weights, provider URLs, and secrets stay outside Git. Only explicitly approved generated evaluation clips are published.
 - All provider actions are dry-run unless `--execute` is supplied.
 - Paid actions reserve projected cost in a local atomic ledger before submission.
 - Paid jobs persist their provider request ID before log streaming so interrupted clients can recover results without resubmitting.
@@ -59,6 +59,15 @@ python scripts/generate.py `
 This is a dry run. Add `--execute` only after the projected request cost and remaining ledger budget have been reviewed.
 
 See [docs/TEST_PLAN.md](docs/TEST_PLAN.md) for acceptance criteria.
+
+## Current evidence
+
+The first two fal generations are published under [`results/videos`](results/videos):
+
+- `t2v-lora-prompt-only-identity-failure.mp4` documents that the 500-step adapter is not sufficient for prompt-only identity generation.
+- `i2v-lora-reference-conditioned.mp4` shows substantially stronger identity preservation when the same adapter is combined with an approved first-frame reference.
+
+See [`results/EVALUATION.md`](results/EVALUATION.md) for the sanitized test record and current cost ledger.
 
 ## Manual selection file
 

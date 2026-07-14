@@ -16,6 +16,7 @@ private_work/
 outputs/
 *.safetensors
 *.mp4
+!results/videos/*.mp4
 *.mov
 *.wav
 *.zip

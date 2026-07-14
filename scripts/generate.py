@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from ltx_lora_pilot.budget import BudgetLedger, estimate_inference_cost
-from ltx_lora_pilot.fal_api import safe_console_text, submit, upload
+from ltx_lora_pilot.fal_api import submit, upload
 from ltx_lora_pilot.generation import build_generation_request, resolve_uploaded_asset
 
 
@@ -101,7 +101,7 @@ def main() -> None:
             endpoint,
             payload,
             on_enqueue=record_request_id,
-            on_update=lambda event: print(safe_console_text(event)),
+            on_update=None,
         )
         result_path = job_dir / "result.json"
         result_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
