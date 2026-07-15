@@ -1103,6 +1103,130 @@ def test_price_capture_rejects_punctuated_reverse_order_a2v_rate() -> None:
 
 
 @pytest.mark.parametrize(
+    "alternate_rate",
+    [
+        "Current rate: $0.007 per-step.",
+        "Per step, the rate is $0.007.",
+        "Each step costs $0.007.",
+        "Rate per training-step = 0.007 USD.",
+        "A single step costs $0.007.",
+        "One training step is priced at 0.007 USD.",
+        "$0.007 for each step.",
+        "Every step costs $0.007.",
+        "A training step costs $0.007.",
+        "$0.007 for an individual step.",
+        "1 step costs $0.007.",
+        "The step price is $0.007.",
+        "$0.007 is charged per step.",
+        "$0.007 is the price for each step.",
+        "A charge of $0.007 applies per step.",
+        "$0.007 is the total cost for each step.",
+        "$0.007 is the overall price for each step.",
+        "Step price is $0.007.",
+        "Each additional step costs $0.007.",
+        "1000 steps are discussed here. Each step costs $6.00.",
+        "Each step is billed at $0.007.",
+        "Each step has a price of $0.007.",
+        "Per step, you pay $0.007.",
+        "The per-step fee is $0.007.",
+        "1000 steps total cost $6.00 per step.",
+        "Each step, you pay $0.007.",
+        "For each step, the fee is $0.007.",
+        "A single step, priced at $0.007.",
+        "1000 steps total cost $6.00 is charged per step.",
+        "1000 steps total cost $6.00 is the price for each step.",
+    ],
+)
+def test_price_capture_rejects_ordinary_unit_step_rate_wording(
+    alternate_rate: str,
+) -> None:
+    response = (
+        f'<section data-model="{ENDPOINT}">{alternate_rate} '
+        f"{'archived-' * 12} calculator: 0.006 * steps; "
+        "1000 steps cost $6.00.</section>"
+    ).encode("ascii")
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+def test_price_capture_keeps_aggregate_step_costs_out_of_unit_rates() -> None:
+    response = (
+        f'<section data-model="{ENDPOINT}">0.006 * steps; '
+        "1000 steps total cost $6.00; total cost $6.00 for 1000 steps; "
+        "a 1,000-step total is $6.00; $6.00 per 1,000 steps; "
+        "1000 steps total cost $6.00 at the per-step rate; "
+        "1000 steps total cost $6.00 based on the per-step rate; "
+        "1000 steps total cost $6.00 calculated using the per-step rate; "
+        "1000 steps total cost $6.00 according to the per-step rate; "
+        "1000 steps total cost $6.00 equivalent to the per-step rate; "
+        "1000 steps total cost $6.00 reflecting the per-step rate; "
+        "How much per step? Total cost: $6.00 for 1000 steps; "
+        "Each step contributes, total cost is $6.00 for 1000 steps."
+        "</section>"
+    ).encode("ascii")
+
+    evidence = _api().capture_price_evidence(
+        fetch=lambda _url: response,
+        now=FIXED_TIME,
+    )
+
+    assert evidence.rate_usd_per_step == "0.006"
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "1000 steps use the formula $0.006 * steps and cost $6.00.",
+        "1000 steps use the per-step formula $0.006 * steps and cost $6.00.",
+        "1000 steps cost $0.006 * steps = $6.00.",
+        "1000 steps price: $0.006 * steps = $6.00.",
+        "1000 steps cost $0.006 per step, totaling $6.00; 0.006 * steps.",
+    ],
+)
+def test_price_capture_accepts_formula_between_step_count_and_total(
+    statement: str,
+) -> None:
+    response = (
+        f'<section data-model="{ENDPOINT}">{statement}</section>'
+    ).encode("ascii")
+
+    evidence = _api().capture_price_evidence(
+        fetch=lambda _url: response,
+        now=FIXED_TIME,
+    )
+
+    assert evidence.rate_usd_per_step == "0.006"
+
+
+@pytest.mark.parametrize(
+    "current_rate",
+    [
+        "Per step, the rate is $0.006 and",
+        "Each step costs $0.006;",
+        "The step price is $0.006, while",
+    ],
+)
+def test_price_capture_keeps_unit_rates_out_of_aggregate_costs(
+    current_rate: str,
+) -> None:
+    response = (
+        f'<section data-model="{ENDPOINT}">{current_rate} '
+        "1000 steps cost $6.00; 0.006 * steps.</section>"
+    ).encode("ascii")
+
+    evidence = _api().capture_price_evidence(
+        fetch=lambda _url: response,
+        now=FIXED_TIME,
+    )
+
+    assert evidence.rate_usd_per_step == "0.006"
+
+
+@pytest.mark.parametrize(
     ("response", "message"),
     [
         (b"Training costs $0.006 * steps.", "unexpected 1,000-step cost"),

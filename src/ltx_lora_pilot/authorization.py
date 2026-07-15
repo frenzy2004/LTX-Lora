@@ -153,26 +153,87 @@ RATE_FORMULA_PATTERN = re.compile(
     r"\s*\*\s*steps\b",
     re.IGNORECASE | re.ASCII,
 )
+UNIT_STEP_RATE_MODIFIERS = (
+    r"(?:(?:additional|individual|training)[\s-]+){0,3}"
+)
+UNIT_STEP_RATE_CONTEXT = (
+    r"(?:"
+    rf"per[\s-]+{UNIT_STEP_RATE_MODIFIERS}steps?"
+    rf"|(?:for[\s-]+)?(?:each|every)[\s-]+{UNIT_STEP_RATE_MODIFIERS}steps?"
+    rf"|(?:for[\s-]+)?(?:1|a|an|one|single)[\s-]+"
+    rf"{UNIT_STEP_RATE_MODIFIERS}step"
+    rf"|(?<![0-9][\s-]){UNIT_STEP_RATE_MODIFIERS}"
+    r"step[\s-]+(?:rate|price|cost)"
+    r")"
+)
+UNIT_STEP_RATE_CONTEXT_PATTERN = re.compile(
+    rf"\b{UNIT_STEP_RATE_CONTEXT}\b",
+    re.IGNORECASE | re.ASCII,
+)
+RATE_UNIT_AMOUNT_CONNECTOR = (
+    r"\s*(?:"
+    r",?\s*(?:the\s+)?(?:rate|price|cost|charge)\s*"
+    r"(?:(?:is|equals)\s*|[:=]\s*)?"
+    r"|(?:costs?|is(?:\s+(?:priced|charged)\s+at)?|equals)\s*"
+    r"|[:=]\s*"
+    r")"
+)
 RATE_PER_STEP_AFTER_PATTERN = re.compile(
     r"(?<![0-9.])\$?(?P<rate>[0-9]+\.[0-9]+)(?![0-9.])"
-    r"\s*(?:USD\s*)?(?:/\s*steps?\b|per\s+(?:training\s+)?steps?\b)",
+    r"(?P<bridge>[^0-9.;?!<>\r\n]{0,48}?)"
+    rf"(?:/\s*(?:training\s+)?steps?\b|\b{UNIT_STEP_RATE_CONTEXT}\b)",
+    re.IGNORECASE | re.ASCII,
+)
+DIRECT_RATE_AFTER_BRIDGE_PATTERN = re.compile(
+    r"\s*(?:USD\s*)?",
+    re.IGNORECASE | re.ASCII,
+)
+ASSERTIVE_RATE_AFTER_BRIDGE_PATTERN = re.compile(
+    r"\s*(?:USD\s*)?(?:"
+    r"(?:is\s+)?(?:charged|billed)"
+    r"|is\s+(?:the\s+)?(?:(?:overall|total)\s+)?"
+    r"(?:charge|cost|fee|price|rate)"
+    r"|applies?"
+    r")\s*",
     re.IGNORECASE | re.ASCII,
 )
 RATE_PER_STEP_BEFORE_PATTERN = re.compile(
-    r"\bper\s+(?:training\s+)?step\b\s*"
-    r"(?:(?:rate|price|costs?)\s*)?(?:is\s*|[:=]\s*)?"
+    rf"\b{UNIT_STEP_RATE_CONTEXT}\b"
+    rf"(?P<bridge>{RATE_UNIT_AMOUNT_CONNECTOR})"
     r"(?<![0-9.])\$?(?P<rate>[0-9]+\.[0-9]+)(?![0-9]|\.[0-9])",
     re.IGNORECASE | re.ASCII,
 )
+RATE_UNIT_SAME_CLAUSE_BEFORE_PATTERN = re.compile(
+    rf"\b{UNIT_STEP_RATE_CONTEXT}\b"
+    r"(?P<bridge>[^0-9,.;?!<>\r\n]{0,48}?)"
+    r"(?<![0-9.])\$?(?P<rate>[0-9]+\.[0-9]+)(?![0-9]|\.[0-9])",
+    re.IGNORECASE | re.ASCII,
+)
+RATE_UNIT_INTRO_BEFORE_PATTERN = re.compile(
+    rf"\b{UNIT_STEP_RATE_CONTEXT}\b,"
+    r"(?P<bridge>[^0-9,.;?!<>\r\n]{0,48}?)"
+    r"(?<![0-9.])\$?(?P<rate>[0-9]+\.[0-9]+)(?![0-9]|\.[0-9])",
+    re.IGNORECASE | re.ASCII,
+)
+STEP_RATE_SUFFIX = (
+    rf"(?:\*\s*steps\b|(?:USD\s*)?(?:/\s*(?:training\s+)?steps?\b|"
+    rf"\b{UNIT_STEP_RATE_CONTEXT}\b))"
+)
+STEP_RATE_OPERAND = r"\$?[0-9]+\.[0-9]+\s*" + STEP_RATE_SUFFIX
 COST_AFTER_STEPS_PATTERN = re.compile(
-    r"\b1,?000\s+steps\b.{0,80}?\$(?P<cost>[0-9]+\.[0-9]+)",
-    re.IGNORECASE | re.ASCII | re.DOTALL,
+    r"\b1,?000\s+steps\b"
+    r"(?P<bridge>(?:[^.;?!<>\r\n]|\.(?=[0-9])){0,80}?)"
+    r"\b(?:costs?|prices?|priced|totals?)\b"
+    rf"(?:(?:{STEP_RATE_OPERAND})|[^$.;?!<>\r\n]){{0,64}}?"
+    r"\$(?P<cost>[0-9]+\.[0-9]+)(?![0-9]|\.[0-9])"
+    rf"(?!\s*{STEP_RATE_SUFFIX})",
+    re.IGNORECASE | re.ASCII,
 )
 COST_BEFORE_STEPS_PATTERN = re.compile(
-    r"\$(?P<cost>[0-9]+\.[0-9]+)(?![0-9.])(?!\s*\*\s*steps)"
-    r"(?!\s*(?:USD\s*)?(?:/\s*|per\s+(?:training\s+)?)steps?\b)"
-    r".{0,80}?\b(?:for\s+)?1,?000\s+steps\b",
-    re.IGNORECASE | re.ASCII | re.DOTALL,
+    r"\$(?P<cost>[0-9]+\.[0-9]+)(?![0-9.])"
+    r"(?P<bridge>[^.;?!<>\r\n]{0,48}?)"
+    r"\b(?:for|per)\s+1,?000\s+steps\b",
+    re.IGNORECASE | re.ASCII,
 )
 MODEL_ENDPOINT_PATTERN = re.compile(
     r"fal-ai/[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*",
@@ -553,23 +614,71 @@ def _verify_price_statement(content: bytes) -> None:
         for context in contexts
         for match in RATE_FORMULA_PATTERN.finditer(context)
     }
-    explicit_rates = formula_rates | {
-        match.group("rate")
-        for context in contexts
-        for pattern in (RATE_PER_STEP_AFTER_PATTERN, RATE_PER_STEP_BEFORE_PATTERN)
-        for match in pattern.finditer(context)
-    }
+    explicit_rates = set(formula_rates)
+    costs: set[str] = set()
+    for context in contexts:
+        formula_spans = {
+            match.span("rate") for match in RATE_FORMULA_PATTERN.finditer(context)
+        }
+        rate_before_matches = list(
+            RATE_PER_STEP_BEFORE_PATTERN.finditer(context)
+        )
+        rate_after_candidates = list(
+            RATE_PER_STEP_AFTER_PATTERN.finditer(context)
+        )
+        direct_rate_after_matches = [
+            match
+            for match in rate_after_candidates
+            if DIRECT_RATE_AFTER_BRIDGE_PATTERN.fullmatch(match.group("bridge"))
+            is not None
+            or ASSERTIVE_RATE_AFTER_BRIDGE_PATTERN.fullmatch(
+                match.group("bridge")
+            )
+            is not None
+        ]
+        strong_rate_matches = rate_before_matches + direct_rate_after_matches
+        strong_rate_spans = formula_spans | {
+            match.span("rate") for match in strong_rate_matches
+        }
+        cost_after_matches = list(COST_AFTER_STEPS_PATTERN.finditer(context))
+        cost_before_matches = [
+            match
+            for match in COST_BEFORE_STEPS_PATTERN.finditer(context)
+            if UNIT_STEP_RATE_CONTEXT_PATTERN.search(match.group("bridge"))
+            is None
+        ]
+        cost_matches = [
+            match
+            for match in cost_after_matches + cost_before_matches
+            if match.span("cost") not in strong_rate_spans
+        ]
+        cost_spans = {match.span("cost") for match in cost_matches}
+        weak_rate_candidates = [
+            match
+            for pattern in (
+                RATE_UNIT_SAME_CLAUSE_BEFORE_PATTERN,
+                RATE_UNIT_INTRO_BEFORE_PATTERN,
+            )
+            for match in pattern.finditer(context)
+            if match.span("rate") not in strong_rate_spans
+        ] + [
+            match
+            for match in rate_after_candidates
+            if match.span("rate") not in strong_rate_spans
+        ]
+        weak_rate_matches = [
+            match
+            for match in weak_rate_candidates
+            if match.span("rate") not in cost_spans
+        ]
+        rate_matches = strong_rate_matches + weak_rate_matches
+        explicit_rates.update(match.group("rate") for match in rate_matches)
+        costs.update(match.group("cost") for match in cost_matches)
     if (
         formula_rates != {A2V_RATE_USD_PER_STEP}
         or explicit_rates != {A2V_RATE_USD_PER_STEP}
     ):
         raise ValueError("unexpected A2V rate")
-    costs = {
-        match.group("cost")
-        for context in contexts
-        for pattern in (COST_AFTER_STEPS_PATTERN, COST_BEFORE_STEPS_PATTERN)
-        for match in pattern.finditer(context)
-    }
     if costs != {"6.00"}:
         raise ValueError("unexpected 1,000-step cost")
 
