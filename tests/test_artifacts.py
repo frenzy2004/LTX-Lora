@@ -61,6 +61,11 @@ def test_safe_relative_name_rejects_non_ascii_input() -> None:
         safe_relative_name("café.json")
 
 
+def test_safe_relative_name_rejects_windows_drive_relative_input() -> None:
+    with pytest.raises(ValueError, match="drive"):
+        safe_relative_name("C:artifact.json")
+
+
 def test_sha256_file_reports_name_size_and_hash(tmp_path: Path) -> None:
     path = tmp_path / "artifact.bin"
     content = (b"a" * (1024 * 1024)) + b"chunk-boundary"

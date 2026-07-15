@@ -68,7 +68,10 @@ def safe_relative_name(name: str) -> str:
         raise ValueError("relative artifact names cannot contain control characters")
     if not name.isascii():
         raise ValueError("relative artifact names must contain ASCII characters only")
-    if PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute():
+    windows_path = PureWindowsPath(name)
+    if windows_path.drive:
+        raise ValueError("relative artifact names cannot contain a Windows drive")
+    if PurePosixPath(name).is_absolute() or windows_path.is_absolute():
         raise ValueError("artifact name must be relative")
     if ".." in name.split("/"):
         raise ValueError("relative artifact names cannot contain '..'")
