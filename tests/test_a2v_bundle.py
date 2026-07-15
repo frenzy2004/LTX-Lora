@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import struct
 import subprocess
@@ -13,6 +14,7 @@ from typing import Any
 
 import pytest
 
+import ltx_lora_pilot.a2v_bundle as a2v_bundle
 from ltx_lora_pilot.a2v_bundle import (
     build_dataset_manifest,
     build_root_manifest,
@@ -39,6 +41,12 @@ REQUIRED_ROOT_ARTIFACTS = {
     "structural_report",
     "training_archive",
 }
+DATASET_ID = "dset_0123456789ab4def8123456789abcdef"
+EXECUTION_ID = "exec_fedcba9876544321a0fedcba98765432"
+
+
+def _machine_group_id(index: int) -> str:
+    return f"grp_000000000000400080000000{index:08x}"
 
 
 def _file_record(path: Path, name: str) -> dict[str, Any]:
@@ -63,9 +71,9 @@ def _make_group(root: Path, group_id: str, split: str) -> dict[str, Any]:
 
 def _fixture_groups(tmp_path: Path) -> list[dict[str, Any]]:
     return [
-        _make_group(tmp_path, "sample_002", "train"),
-        _make_group(tmp_path, "sample_003", "holdout"),
-        _make_group(tmp_path, "sample_001", "train"),
+        _make_group(tmp_path, _machine_group_id(2), "train"),
+        _make_group(tmp_path, _machine_group_id(3), "holdout"),
+        _make_group(tmp_path, _machine_group_id(1), "train"),
     ]
 
 
@@ -118,6 +126,44 @@ def _mark_zip_encrypted(path: Path) -> None:
     path.write_bytes(content)
 
 
+def _patch_zip_names(path: Path, *, local_name: bytes, central_name: bytes) -> None:
+    content = bytearray(path.read_bytes())
+    local_offset = content.index(b"PK\x03\x04")
+    central_offset = content.index(b"PK\x01\x02")
+    local_length = struct.unpack_from("<H", content, local_offset + 26)[0]
+    central_length = struct.unpack_from("<H", content, central_offset + 28)[0]
+    assert len(local_name) == local_length
+    assert len(central_name) == central_length
+    content[local_offset + 30 : local_offset + 30 + local_length] = local_name
+    content[central_offset + 46 : central_offset + 46 + central_length] = central_name
+    path.write_bytes(content)
+
+
+def _patch_zip_flags(
+    path: Path,
+    *,
+    local_flags: int | None = None,
+    central_flags: int | None = None,
+) -> None:
+    content = bytearray(path.read_bytes())
+    if local_flags is not None:
+        local_offset = content.index(b"PK\x03\x04")
+        struct.pack_into("<H", content, local_offset + 6, local_flags)
+    if central_flags is not None:
+        central_offset = content.index(b"PK\x01\x02")
+        struct.pack_into("<H", content, central_offset + 8, central_flags)
+    path.write_bytes(content)
+
+
+def _patch_zip_uncompressed_size(path: Path, size: int) -> None:
+    content = bytearray(path.read_bytes())
+    local_offset = content.index(b"PK\x03\x04")
+    central_offset = content.index(b"PK\x01\x02")
+    struct.pack_into("<L", content, local_offset + 22, size)
+    struct.pack_into("<L", content, central_offset + 24, size)
+    path.write_bytes(content)
+
+
 def _artifact_digest(label: str) -> FileDigest:
     content = f"artifact:{label}".encode("ascii")
     return FileDigest(
@@ -134,7 +180,7 @@ def _reports(
     structural_groups = []
     quality_groups = []
     for index in range(15):
-        group_id = f"sample_{index + 1:03d}"
+        group_id = _machine_group_id(index + 1)
         split = "train" if index < 10 else "holdout"
         files = []
         for suffix in (".txt", "_audio.wav", "_end.mp4", "_start.png"):
@@ -176,7 +222,7 @@ def _reports(
     }
     attestation = {
         "schema_version": "a2v-quality-attestation-v1",
-        "dataset_id": "dataset-001",
+        "dataset_id": DATASET_ID,
         "rights_and_consent": {
             "confirmed": True,
             "reviewer_id": "reviewer-opaque-001",
@@ -185,6 +231,24 @@ def _reports(
         "groups": list(reversed(quality_groups)),
     }
     return structural, attestation
+
+
+def _valid_root_manifest() -> dict[str, Any]:
+    structural, attestation = _reports()
+    dataset = build_dataset_manifest(
+        structural,
+        attestation,
+        _artifact_digest("training-data"),
+    )
+    artifacts = {role: _artifact_digest(role) for role in REQUIRED_ROOT_ARTIFACTS}
+    return build_root_manifest(
+        execution_id=EXECUTION_ID,
+        created_at_utc="2026-07-15T01:00:00Z",
+        expires_at_utc="2026-07-16T01:00:00Z",
+        repository_commit="f" * 40,
+        artifacts=artifacts,
+        holdout_groups=dataset["groups"]["holdout"],
+    )
 
 
 def test_archive_is_byte_identical_across_two_builds(tmp_path: Path) -> None:
@@ -225,7 +289,7 @@ def test_archive_contains_train_groups_only(tmp_path: Path) -> None:
     with zipfile.ZipFile(tmp_path / "training.zip") as archive:
         names = archive.namelist()
         assert len(names) == 8
-        assert all(not name.startswith("sample_003") for name in names)
+        assert all(not name.startswith(_machine_group_id(3)) for name in names)
 
 
 @pytest.mark.parametrize(
@@ -285,6 +349,57 @@ def test_inspection_rejects_encrypted_members_before_reading(tmp_path: Path) -> 
     _mark_zip_encrypted(path)
 
     with pytest.raises(ValueError, match="encryption"):
+        inspect_training_archive(path, expected)
+
+
+def test_inspection_rejects_raw_nul_member_name(tmp_path: Path) -> None:
+    path = tmp_path / "nul-name.zip"
+    content = b"content"
+    _write_zip(path, [("safe.txt", content)])
+    _patch_zip_names(path, local_name=b"safe\x00txt", central_name=b"safe\x00txt")
+
+    with pytest.raises(ValueError, match="raw member name"):
+        inspect_training_archive(path, [_digest_record("safe", content)])
+
+
+def test_inspection_rejects_hidden_trailing_payload(tmp_path: Path) -> None:
+    path = tmp_path / "trailing.zip"
+    expected = _write_zip(path, [("sample.txt", b"content")])
+    with path.open("ab") as archive:
+        archive.write(b"HIDDEN-TRAILING-PAYLOAD")
+
+    with pytest.raises(ValueError, match="trailing payload"):
+        inspect_training_archive(path, expected)
+
+
+def test_inspection_requires_equal_stored_sizes(tmp_path: Path) -> None:
+    path = tmp_path / "stored-size.zip"
+    content = b"12345678"
+    expected = _write_zip(path, [("sample.txt", content)])
+    _patch_zip_uncompressed_size(path, len(content) - 1)
+
+    with pytest.raises(ValueError, match="stored sizes"):
+        inspect_training_archive(path, expected)
+
+
+@pytest.mark.parametrize(
+    ("local_flags", "central_flags"),
+    [(0x800, 0), (0x800, 0x800)],
+)
+def test_inspection_requires_canonical_ascii_header_flags(
+    tmp_path: Path,
+    local_flags: int,
+    central_flags: int,
+) -> None:
+    path = tmp_path / "flags.zip"
+    expected = _write_zip(path, [("sample.txt", b"content")])
+    _patch_zip_flags(
+        path,
+        local_flags=local_flags,
+        central_flags=central_flags,
+    )
+
+    with pytest.raises(ValueError, match="canonical ZIP headers"):
         inspect_training_archive(path, expected)
 
 
@@ -394,6 +509,123 @@ def test_builder_rejects_source_changed_after_structural_validation(
     assert not (tmp_path / "training.zip").exists()
 
 
+def test_builder_rejects_human_readable_group_id(tmp_path: Path) -> None:
+    groups = [_make_group(tmp_path, "human_readable_label", "train")]
+
+    with pytest.raises(ValueError, match="machine-generated opaque group ID"):
+        build_training_archive(groups, tmp_path / "training.zip")
+
+
+@pytest.mark.parametrize("use_hardlink", [False, True])
+def test_builder_rejects_destination_aliasing_holdout_source(
+    tmp_path: Path,
+    use_hardlink: bool,
+) -> None:
+    groups = _fixture_groups(tmp_path)
+    holdout = next(group for group in groups if group["split"] == "holdout")
+    source = holdout["files"][0]["path"]
+    original = source.read_bytes()
+    destination = source
+    if use_hardlink:
+        destination = tmp_path / "holdout-alias.zip"
+        os.link(source, destination)
+
+    with pytest.raises(ValueError, match="aliases a source member"):
+        build_training_archive(groups, destination)
+
+    assert source.read_bytes() == original
+    assert destination.read_bytes() == original
+
+
+def test_builder_prechecks_member_limit_before_replacing_destination(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "training.zip"
+    previous = b"previous-reviewed-archive"
+    destination.write_bytes(previous)
+    groups = [
+        _make_group(tmp_path, _machine_group_id(index), "train")
+        for index in range(1, 102)
+    ]
+
+    with pytest.raises(ValueError, match="declared member-count limit"):
+        build_training_archive(groups, destination)
+
+    assert destination.read_bytes() == previous
+
+
+def test_builder_prechecks_declared_size_before_reading_or_replacing(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "training.zip"
+    previous = b"previous-reviewed-archive"
+    destination.write_bytes(previous)
+    groups = _fixture_groups(tmp_path)
+    train = next(group for group in groups if group["split"] == "train")
+    train["files"][0]["bytes"] = a2v_bundle.MAX_ARCHIVE_UNCOMPRESSED_BYTES + 1
+
+    with pytest.raises(ValueError, match="declared uncompressed-size limit"):
+        build_training_archive(groups, destination)
+
+    assert destination.read_bytes() == previous
+
+
+@pytest.mark.parametrize("limit_case", ["member", "aggregate"])
+def test_builder_prechecks_declared_zip64_requirement(
+    tmp_path: Path,
+    limit_case: str,
+) -> None:
+    destination = tmp_path / "training.zip"
+    previous = b"previous-reviewed-archive"
+    destination.write_bytes(previous)
+    groups = [_make_group(tmp_path, _machine_group_id(1), "train")]
+    files = groups[0]["files"]
+    if limit_case == "member":
+        files[0]["bytes"] = (zipfile.ZIP64_LIMIT * 100 // 105) + 1
+    else:
+        unchanged_bytes = sum(record["bytes"] for record in files[2:])
+        files[0]["bytes"] = a2v_bundle.MAX_ARCHIVE_UNCOMPRESSED_BYTES // 2
+        files[1]["bytes"] = (
+            a2v_bundle.MAX_ARCHIVE_UNCOMPRESSED_BYTES
+            - files[0]["bytes"]
+            - unchanged_bytes
+        )
+
+    with pytest.raises(ValueError, match="declared ZIP64 requirement"):
+        build_training_archive(groups, destination)
+
+    assert destination.read_bytes() == previous
+
+
+def test_builder_inspects_temporary_archive_before_final_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "training.zip"
+    destination.write_bytes(b"previous-reviewed-archive")
+    groups = _fixture_groups(tmp_path)
+    real_inspector = a2v_bundle.inspect_training_archive
+    inspected: list[Path] = []
+
+    def recording_inspector(
+        archive_path: Path,
+        expected_members: Any,
+        **limits: Any,
+    ) -> FileDigest:
+        result = real_inspector(archive_path, expected_members, **limits)
+        inspected.append(Path(archive_path))
+        return result
+
+    monkeypatch.setattr(a2v_bundle, "inspect_training_archive", recording_inspector)
+
+    build_training_archive(groups, destination)
+
+    assert len(inspected) == 2
+    assert inspected[0].parent == destination.parent
+    assert inspected[0] != destination
+    assert inspected[1] == destination
+
+
 def test_dataset_manifest_binds_train_holdout_reports_and_archive() -> None:
     structural, attestation = _reports()
     archive = _artifact_digest("training-data")
@@ -403,7 +635,7 @@ def test_dataset_manifest_binds_train_holdout_reports_and_archive() -> None:
     structural_bytes = canonical_json_bytes(structural)
     attestation_bytes = canonical_json_bytes(attestation)
     assert manifest["schema_version"] == "a2v-dataset-manifest-v1"
-    assert manifest["dataset_id"] == "dataset-001"
+    assert manifest["dataset_id"] == DATASET_ID
     assert manifest["counts"] == {"holdout_groups": 5, "train_groups": 10}
     assert len(manifest["training_members"]) == 40
     assert len(manifest["groups"]["train"]) == 10
@@ -432,7 +664,7 @@ def test_dataset_manifest_binds_train_holdout_reports_and_archive() -> None:
 
 def test_dataset_manifest_verifies_all_candidate_bytes(tmp_path: Path) -> None:
     structural, attestation = _reports(candidate_root=tmp_path)
-    holdout_name = "sample_015_end.mp4"
+    holdout_name = f"{_machine_group_id(15)}_end.mp4"
     (tmp_path / holdout_name).write_bytes(b"changed-holdout")
 
     with pytest.raises(ValueError, match="does not match its structural digest"):
@@ -444,11 +676,35 @@ def test_dataset_manifest_verifies_all_candidate_bytes(tmp_path: Path) -> None:
         )
 
 
-def test_dataset_manifest_rejects_free_form_identifying_dataset_id() -> None:
+def test_dataset_manifest_rejects_human_readable_dataset_id() -> None:
     structural, attestation = _reports()
-    attestation["dataset_id"] = "Private Person Name"
+    attestation["dataset_id"] = "human_readable_label"
 
-    with pytest.raises(ValueError, match="canonical opaque ID"):
+    with pytest.raises(ValueError, match="machine-generated opaque ID"):
+        build_dataset_manifest(
+            structural,
+            attestation,
+            _artifact_digest("training-data"),
+        )
+
+
+def test_dataset_manifest_rejects_human_readable_group_id() -> None:
+    structural, attestation = _reports()
+    structural_group = structural["groups"][0]
+    old_group_id = structural_group["group_id"]
+    structural_group["group_id"] = "human_readable_label"
+    for record in structural_group["files"]:
+        record["name"] = record["name"].replace(
+            old_group_id,
+            "human_readable_label",
+            1,
+        )
+    attestation_group = next(
+        group for group in attestation["groups"] if group["group_id"] == old_group_id
+    )
+    attestation_group["group_id"] = "human_readable_label"
+
+    with pytest.raises(ValueError, match="machine-generated opaque group ID"):
         build_dataset_manifest(
             structural,
             attestation,
@@ -466,7 +722,7 @@ def test_root_manifest_has_an_explicit_digest_domain() -> None:
     artifacts = {role: _artifact_digest(role) for role in REQUIRED_ROOT_ARTIFACTS}
 
     root_manifest = build_root_manifest(
-        execution_id="execution-001",
+        execution_id=EXECUTION_ID,
         created_at_utc="2026-07-15T01:00:00Z",
         expires_at_utc="2026-07-16T01:00:00Z",
         repository_commit="f" * 40,
@@ -497,7 +753,7 @@ def test_root_manifest_rejects_runtime_only_artifact_roles(runtime_role: str) ->
 
     with pytest.raises(ValueError, match="artifact roles"):
         build_root_manifest(
-            execution_id="execution-001",
+            execution_id=EXECUTION_ID,
             created_at_utc="2026-07-15T01:00:00Z",
             expires_at_utc="2026-07-16T01:00:00Z",
             repository_commit="f" * 40,
@@ -517,13 +773,108 @@ def test_root_manifest_requires_five_bound_holdout_groups() -> None:
 
     with pytest.raises(ValueError, match="at least five holdout groups"):
         build_root_manifest(
-            execution_id="execution-001",
+            execution_id=EXECUTION_ID,
             created_at_utc="2026-07-15T01:00:00Z",
             expires_at_utc="2026-07-16T01:00:00Z",
             repository_commit="f" * 40,
             artifacts=artifacts,
             holdout_groups=dataset["groups"]["holdout"][:4],
         )
+
+
+def test_root_manifest_rejects_human_readable_execution_id() -> None:
+    structural, attestation = _reports()
+    dataset = build_dataset_manifest(
+        structural,
+        attestation,
+        _artifact_digest("training-data"),
+    )
+    artifacts = {role: _artifact_digest(role) for role in REQUIRED_ROOT_ARTIFACTS}
+
+    with pytest.raises(ValueError, match="machine-generated opaque ID"):
+        build_root_manifest(
+            execution_id="human_readable_label",
+            created_at_utc="2026-07-15T01:00:00Z",
+            expires_at_utc="2026-07-16T01:00:00Z",
+            repository_commit="f" * 40,
+            artifacts=artifacts,
+            holdout_groups=dataset["groups"]["holdout"],
+        )
+
+
+@pytest.mark.parametrize("mutation", ["unknown", "missing"])
+def test_compute_bundle_id_rejects_non_exact_top_level_schema(mutation: str) -> None:
+    root_manifest = _valid_root_manifest()
+    if mutation == "unknown":
+        root_manifest["approval"] = {"status": "runtime-only"}
+    else:
+        del root_manifest["created_at_utc"]
+
+    with pytest.raises(ValueError, match="exact top-level keys"):
+        compute_bundle_id(root_manifest)
+
+
+def test_compute_bundle_id_rejects_unknown_nested_artifact_role() -> None:
+    root_manifest = _valid_root_manifest()
+    root_manifest["artifacts"]["logs"] = {
+        "bytes": 0,
+        "sha256": "0" * 64,
+    }
+
+    with pytest.raises(ValueError, match="artifact roles"):
+        compute_bundle_id(root_manifest)
+
+
+def test_compute_bundle_id_rejects_unknown_nested_digest_field() -> None:
+    root_manifest = _valid_root_manifest()
+    root_manifest["artifacts"]["plan"]["provider_state"] = "runtime-only"
+
+    with pytest.raises(ValueError, match="exact digest"):
+        compute_bundle_id(root_manifest)
+
+
+def test_compute_bundle_id_rejects_unknown_nested_holdout_field() -> None:
+    root_manifest = _valid_root_manifest()
+    root_manifest["holdout_groups"][0]["outputs"] = []
+
+    with pytest.raises(ValueError, match="holdout group"):
+        compute_bundle_id(root_manifest)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("schema_version", "a2v-bundle-manifest-v2"),
+        ("canonical_json_version", 2),
+        ("builder_version", "a2v-bundle-builder-v2"),
+        ("validator_version", "a2v-validator-v2"),
+    ],
+)
+def test_compute_bundle_id_rejects_unsupported_root_versions(
+    field: str,
+    invalid_value: Any,
+) -> None:
+    root_manifest = _valid_root_manifest()
+    root_manifest[field] = invalid_value
+
+    with pytest.raises(ValueError, match="root manifest"):
+        compute_bundle_id(root_manifest)
+
+
+def test_compute_bundle_id_rejects_human_readable_holdout_group_id() -> None:
+    root_manifest = _valid_root_manifest()
+    root_manifest["holdout_groups"][0]["group_id"] = "human_readable_label"
+
+    with pytest.raises(ValueError, match="machine-generated opaque group ID"):
+        compute_bundle_id(root_manifest)
+
+
+def test_compute_bundle_id_requires_canonical_holdout_order() -> None:
+    root_manifest = _valid_root_manifest()
+    root_manifest["holdout_groups"].reverse()
+
+    with pytest.raises(ValueError, match="canonical holdout order"):
+        compute_bundle_id(root_manifest)
 
 
 def test_bundle_id_excludes_self_hash() -> None:
@@ -549,12 +900,12 @@ def test_build_command_writes_only_content_addressed_bundle_outputs(
         control / "standing-authorization.json": {"policy_id": "policy-001"},
         control / "price-evidence.json": {"rate_usd_per_step": "0.006"},
         control / "execution-config.json": {
-            "execution_id": "execution-001",
+            "execution_id": EXECUTION_ID,
             "created_at_utc": "2026-07-15T01:00:00Z",
             "expires_at_utc": "2026-07-16T01:00:00Z",
         },
         validation / "provider-validation-selection.json": {
-            "group_ids": ["sample_011", "sample_012"]
+            "group_ids": [_machine_group_id(11), _machine_group_id(12)]
         },
     }
     for path, value in inputs.items():
@@ -585,8 +936,13 @@ def test_build_command_writes_only_content_addressed_bundle_outputs(
     assert private_path_bytes not in (bundle / "dataset-manifest.json").read_bytes()
     assert private_path_bytes not in (bundle / "bundle-manifest.json").read_bytes()
     with zipfile.ZipFile(bundle / "training-data.zip") as archive:
-        assert len(archive.namelist()) == 40
-        assert all(not name.startswith("sample_01") or name.startswith("sample_010") for name in archive.namelist())
+        expected_names = {
+            record["name"]
+            for group in structural["groups"]
+            if group["group_id"] in {_machine_group_id(index) for index in range(1, 11)}
+            for record in group["files"]
+        }
+        assert set(archive.namelist()) == expected_names
 
 
 def test_build_command_sanitizes_parse_and_runtime_failures(tmp_path: Path) -> None:

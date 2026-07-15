@@ -4,13 +4,13 @@ import hashlib
 import os
 import re
 import stat
+import struct
 import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from .a2v_dataset import GROUP_ID_PATTERN
 from .a2v_quality import validate_quality_and_splits
 from .artifacts import (
     FileDigest,
@@ -27,10 +27,15 @@ VALIDATOR_VERSION = "a2v-validator-v1"
 FIXED_ARCHIVE_DATETIME = (1980, 1, 1, 0, 0, 0)
 FIXED_EXTERNAL_ATTR = (stat.S_IFREG | 0o600) << 16
 MAX_ARCHIVE_MEMBERS = 400
-MAX_ARCHIVE_UNCOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = (1 << 31) - 1
 MAX_ARCHIVE_COMPRESSION_RATIO = 2
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}", re.ASCII)
-OPAQUE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", re.ASCII)
+# Bundle-visible identities are typed UUIDv4 values rendered as 32 lowercase
+# hex digits. The type prefix is public; the token contains no human label.
+UUID4_HEX = r"[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}"
+GROUP_BUNDLE_ID_PATTERN = re.compile(rf"grp_{UUID4_HEX}", re.ASCII)
+DATASET_BUNDLE_ID_PATTERN = re.compile(rf"dset_{UUID4_HEX}", re.ASCII)
+EXECUTION_BUNDLE_ID_PATTERN = re.compile(rf"exec_{UUID4_HEX}", re.ASCII)
 REQUIRED_ROOT_ARTIFACT_ROLES = frozenset(
     {
         "dataset_manifest",
@@ -44,6 +49,30 @@ REQUIRED_ROOT_ARTIFACT_ROLES = frozenset(
         "training_archive",
     }
 )
+ROOT_MANIFEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "canonical_json_version",
+        "execution_id",
+        "created_at_utc",
+        "expires_at_utc",
+        "builder_version",
+        "validator_version",
+        "repository_commit",
+        "artifacts",
+        "holdout_groups",
+    }
+)
+LOCAL_FILE_HEADER = struct.Struct("<4s5H3L2H")
+CENTRAL_DIRECTORY_HEADER = struct.Struct("<4s6H3L5H2L")
+END_OF_CENTRAL_DIRECTORY = struct.Struct("<4s4H2LH")
+LOCAL_FILE_SIGNATURE = b"PK\x03\x04"
+CENTRAL_DIRECTORY_SIGNATURE = b"PK\x01\x02"
+END_OF_CENTRAL_DIRECTORY_SIGNATURE = b"PK\x05\x06"
+CANONICAL_ZIP_VERSION = 20
+CANONICAL_ZIP_MADE_BY = (3 << 8) | CANONICAL_ZIP_VERSION
+CANONICAL_DOS_TIME = 0
+CANONICAL_DOS_DATE = 33
 
 
 def _is_symlink_or_junction(path: Path) -> bool:
@@ -122,8 +151,11 @@ def _canonical_manifest_group(value: Any, *, label: str) -> dict[str, Any]:
     if type(value) is not dict or set(value) != {"group_id", "files"}:
         raise ValueError(f"{label} must contain exactly group_id and files")
     group_id = value["group_id"]
-    if type(group_id) is not str or GROUP_ID_PATTERN.fullmatch(group_id) is None:
-        raise ValueError(f"{label} has an unsafe group ID")
+    if (
+        type(group_id) is not str
+        or GROUP_BUNDLE_ID_PATTERN.fullmatch(group_id) is None
+    ):
+        raise ValueError(f"{label} must use a machine-generated opaque group ID")
     files_value = value["files"]
     if type(files_value) is not list or len(files_value) != 4:
         raise ValueError(f"{label} must contain exactly four file digests")
@@ -173,8 +205,13 @@ def _source_groups(groups: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
         if type(value) is not dict or set(value) != {"group_id", "split", "files"}:
             raise ValueError(f"archive group {index} must contain group_id, split, and files")
         group_id = value["group_id"]
-        if type(group_id) is not str or GROUP_ID_PATTERN.fullmatch(group_id) is None:
-            raise ValueError(f"archive group {index} has an unsafe group ID")
+        if (
+            type(group_id) is not str
+            or GROUP_BUNDLE_ID_PATTERN.fullmatch(group_id) is None
+        ):
+            raise ValueError(
+                f"archive group {index} must use a machine-generated opaque group ID"
+            )
         if group_id in seen_group_ids:
             raise ValueError(f"archive groups contain duplicate group ID {group_id}")
         seen_group_ids.add(group_id)
@@ -254,6 +291,149 @@ def _fsync_parent(path: Path) -> None:
             os.close(descriptor)
 
 
+def _read_exact(source: Any, byte_count: int) -> bytes:
+    content = source.read(byte_count)
+    if len(content) != byte_count:
+        raise ValueError("training archive has non-canonical ZIP headers")
+    return content
+
+
+def _inspect_canonical_zip_layout(
+    archive_path: Path,
+    infos: list[zipfile.ZipInfo],
+) -> None:
+    with archive_path.open("rb") as source:
+        archive_size = os.fstat(source.fileno()).st_size
+        if archive_size < END_OF_CENTRAL_DIRECTORY.size:
+            raise ValueError("training archive has non-canonical ZIP headers")
+        eocd_offset = archive_size - END_OF_CENTRAL_DIRECTORY.size
+        source.seek(eocd_offset)
+        eocd = END_OF_CENTRAL_DIRECTORY.unpack(
+            _read_exact(source, END_OF_CENTRAL_DIRECTORY.size)
+        )
+        if eocd[0] != END_OF_CENTRAL_DIRECTORY_SIGNATURE:
+            raise ValueError("training archive contains a hidden trailing payload")
+        (
+            _,
+            disk_number,
+            central_disk,
+            disk_entries,
+            total_entries,
+            central_size,
+            central_offset,
+            comment_length,
+        ) = eocd
+        if (
+            disk_number != 0
+            or central_disk != 0
+            or disk_entries != len(infos)
+            or total_entries != len(infos)
+            or comment_length != 0
+            or central_offset + central_size != eocd_offset
+        ):
+            raise ValueError("training archive has non-canonical ZIP headers")
+
+        cursor = 0
+        for info in infos:
+            if info.header_offset != cursor:
+                raise ValueError("training archive has non-canonical ZIP headers")
+            source.seek(cursor)
+            local = LOCAL_FILE_HEADER.unpack(
+                _read_exact(source, LOCAL_FILE_HEADER.size)
+            )
+            (
+                signature,
+                extract_version,
+                flags,
+                compression,
+                modified_time,
+                modified_date,
+                crc,
+                compressed_size,
+                uncompressed_size,
+                name_length,
+                extra_length,
+            ) = local
+            raw_name = _read_exact(source, name_length)
+            raw_extra = _read_exact(source, extra_length)
+            expected_name = info.filename.encode("ascii")
+            if (
+                signature != LOCAL_FILE_SIGNATURE
+                or extract_version != CANONICAL_ZIP_VERSION
+                or flags != 0
+                or compression != zipfile.ZIP_STORED
+                or modified_time != CANONICAL_DOS_TIME
+                or modified_date != CANONICAL_DOS_DATE
+                or crc != info.CRC
+                or compressed_size != info.compress_size
+                or uncompressed_size != info.file_size
+                or raw_name != expected_name
+                or raw_extra
+            ):
+                raise ValueError("training archive has non-canonical ZIP headers")
+            cursor += LOCAL_FILE_HEADER.size + name_length + extra_length + compressed_size
+        if cursor != central_offset:
+            raise ValueError("training archive has non-canonical ZIP headers")
+
+        cursor = central_offset
+        for info in infos:
+            source.seek(cursor)
+            central = CENTRAL_DIRECTORY_HEADER.unpack(
+                _read_exact(source, CENTRAL_DIRECTORY_HEADER.size)
+            )
+            (
+                signature,
+                made_by,
+                extract_version,
+                flags,
+                compression,
+                modified_time,
+                modified_date,
+                crc,
+                compressed_size,
+                uncompressed_size,
+                name_length,
+                extra_length,
+                member_comment_length,
+                start_disk,
+                internal_attr,
+                external_attr,
+                local_offset,
+            ) = central
+            raw_name = _read_exact(source, name_length)
+            raw_extra = _read_exact(source, extra_length)
+            raw_comment = _read_exact(source, member_comment_length)
+            expected_name = info.filename.encode("ascii")
+            if (
+                signature != CENTRAL_DIRECTORY_SIGNATURE
+                or made_by != CANONICAL_ZIP_MADE_BY
+                or extract_version != CANONICAL_ZIP_VERSION
+                or flags != 0
+                or compression != zipfile.ZIP_STORED
+                or modified_time != CANONICAL_DOS_TIME
+                or modified_date != CANONICAL_DOS_DATE
+                or crc != info.CRC
+                or compressed_size != info.compress_size
+                or uncompressed_size != info.file_size
+                or raw_name != expected_name
+                or raw_extra
+                or raw_comment
+                or start_disk != 0
+                or internal_attr != 0
+                or external_attr != FIXED_EXTERNAL_ATTR
+                or local_offset != info.header_offset
+            ):
+                raise ValueError("training archive has non-canonical ZIP headers")
+            cursor += (
+                CENTRAL_DIRECTORY_HEADER.size
+                + name_length
+                + extra_length
+                + member_comment_length
+            )
+        if cursor != central_offset + central_size or cursor != eocd_offset:
+            raise ValueError("training archive has non-canonical ZIP headers")
+
+
 def _write_source_member(
     archive: zipfile.ZipFile,
     source: Mapping[str, Any],
@@ -281,6 +461,27 @@ def _write_source_member(
         raise ValueError(f"archive member {name} does not match its structural digest")
 
 
+def _declared_layout_requires_zip64(members: list[dict[str, Any]]) -> bool:
+    if any(
+        member["bytes"] * 105 > zipfile.ZIP64_LIMIT * 100
+        for member in members
+    ):
+        return True
+    central_offset = sum(
+        LOCAL_FILE_HEADER.size + len(member["name"].encode("ascii")) + member["bytes"]
+        for member in members
+    )
+    central_size = sum(
+        CENTRAL_DIRECTORY_HEADER.size + len(member["name"].encode("ascii"))
+        for member in members
+    )
+    return (
+        central_offset > zipfile.ZIP64_LIMIT
+        or central_size > zipfile.ZIP64_LIMIT
+        or len(members) > zipfile.ZIP_FILECOUNT_LIMIT
+    )
+
+
 def build_training_archive(
     groups: Iterable[Mapping[str, Any]],
     destination: Path,
@@ -289,6 +490,7 @@ def build_training_archive(
 
     destination = Path(destination)
     normalized_groups = _source_groups(groups)
+    all_sources = [file for group in normalized_groups for file in group["files"]]
     members = [
         file
         for group in normalized_groups
@@ -303,12 +505,18 @@ def build_training_archive(
         raise ValueError("training archive contains duplicate member names")
     if len({name.casefold() for name in names}) != len(names):
         raise ValueError("training archive contains case-colliding member names")
+    if len(members) > MAX_ARCHIVE_MEMBERS:
+        raise ValueError("training archive exceeds the declared member-count limit")
+    if sum(member["bytes"] for member in members) > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+        raise ValueError("training archive exceeds the declared uncompressed-size limit")
+    if _declared_layout_requires_zip64(members):
+        raise ValueError("training archive has a prohibited declared ZIP64 requirement")
     if not destination.parent.is_dir() or _is_symlink_or_junction(destination.parent):
         raise ValueError("training archive destination parent must be a regular directory")
     if _is_symlink_or_junction(destination):
         raise ValueError("training archive destination must not be a link")
-    for member in members:
-        if _same_path(destination, member["path"]):
+    for source in all_sources:
+        if _same_path(destination, source["path"]):
             raise ValueError("training archive destination aliases a source member")
 
     expected = [
@@ -329,13 +537,14 @@ def build_training_archive(
             temporary_path,
             mode="w",
             compression=zipfile.ZIP_STORED,
-            allowZip64=True,
+            allowZip64=False,
         ) as archive:
             archive.comment = b""
             for member in members:
                 _write_source_member(archive, member)
         with temporary_path.open("r+b") as temporary:
             os.fsync(temporary.fileno())
+        inspect_training_archive(temporary_path, expected)
         os.replace(temporary_path, destination)
         temporary_path = None
         _fsync_parent(destination.parent)
@@ -377,6 +586,13 @@ def inspect_training_archive(
             casefolded: set[str] = set()
             total_size = 0
             for info in infos:
+                if (
+                    type(info.orig_filename) is not str
+                    or "\x00" in info.orig_filename
+                    or info.orig_filename != info.filename
+                ):
+                    raise ValueError("training archive contains an invalid raw member name")
+                _validate_member_name(info.orig_filename)
                 name = _validate_member_name(info.filename)
                 if name in seen:
                     raise ValueError("training archive contains duplicate member names")
@@ -389,6 +605,8 @@ def inspect_training_archive(
 
                 if info.flag_bits & 0x1:
                     raise ValueError("training archive member encryption is prohibited")
+                if info.flag_bits != 0:
+                    raise ValueError("training archive has non-canonical ZIP headers")
                 if info.is_dir():
                     raise ValueError("training archive members require regular-file attributes")
                 unix_mode = info.external_attr >> 16
@@ -407,6 +625,8 @@ def inspect_training_archive(
                     raise ValueError("training archive exceeds the compression-ratio limit")
                 if info.compress_type != zipfile.ZIP_STORED:
                     raise ValueError("training archive members must use ZIP_STORED")
+                if info.compress_size != info.file_size:
+                    raise ValueError("training archive ZIP_STORED member has unequal stored sizes")
                 if (
                     info.date_time != FIXED_ARCHIVE_DATETIME
                     or info.internal_attr != 0
@@ -417,6 +637,7 @@ def inspect_training_archive(
 
             if names != sorted(names):
                 raise ValueError("training archive member order is not lexical")
+            _inspect_canonical_zip_layout(archive_path, infos)
             unexpected = sorted(set(names) - set(expected))
             if unexpected:
                 raise ValueError("training archive contains unexpected members")
@@ -475,8 +696,11 @@ def build_dataset_manifest(
 
     summary = validate_quality_and_splits(quality_attestation, structural_report)
     dataset_id = quality_attestation["dataset_id"]
-    if type(dataset_id) is not str or OPAQUE_ID_PATTERN.fullmatch(dataset_id) is None:
-        raise ValueError("dataset_id must be a canonical opaque ID")
+    if (
+        type(dataset_id) is not str
+        or DATASET_BUNDLE_ID_PATTERN.fullmatch(dataset_id) is None
+    ):
+        raise ValueError("dataset_id must be a machine-generated opaque ID")
     structural_groups = {
         group["group_id"]: _canonical_manifest_group(
             group,
@@ -555,6 +779,52 @@ def _canonical_holdout_groups(values: Any) -> list[dict[str, Any]]:
     return sorted(result, key=lambda group: group["group_id"])
 
 
+def _validate_serialized_root_manifest(root_manifest: Any) -> None:
+    if type(root_manifest) is not dict or set(root_manifest) != ROOT_MANIFEST_KEYS:
+        raise ValueError("root manifest must contain the exact top-level keys")
+    if root_manifest["schema_version"] != ROOT_MANIFEST_SCHEMA:
+        raise ValueError("root manifest has an unsupported schema_version")
+    if (
+        type(root_manifest["canonical_json_version"]) is not int
+        or root_manifest["canonical_json_version"] != 1
+    ):
+        raise ValueError("root manifest has an unsupported canonical_json_version")
+    if root_manifest["builder_version"] != ARCHIVE_BUILDER_VERSION:
+        raise ValueError("root manifest has an unsupported builder_version")
+    if root_manifest["validator_version"] != VALIDATOR_VERSION:
+        raise ValueError("root manifest has an unsupported validator_version")
+
+    execution_id = root_manifest["execution_id"]
+    if (
+        type(execution_id) is not str
+        or EXECUTION_BUNDLE_ID_PATTERN.fullmatch(execution_id) is None
+    ):
+        raise ValueError("execution_id must be a machine-generated opaque ID")
+    created = _utc_timestamp(root_manifest["created_at_utc"], label="created_at_utc")
+    expires = _utc_timestamp(root_manifest["expires_at_utc"], label="expires_at_utc")
+    if expires <= created:
+        raise ValueError("expires_at_utc must be after created_at_utc")
+    repository_commit = root_manifest["repository_commit"]
+    if type(repository_commit) is not str or re.fullmatch(
+        r"[0-9a-f]{40}", repository_commit, re.ASCII
+    ) is None:
+        raise ValueError("repository_commit must be a full lowercase Git commit")
+
+    artifacts = root_manifest["artifacts"]
+    if type(artifacts) is not dict or set(artifacts) != REQUIRED_ROOT_ARTIFACT_ROLES:
+        raise ValueError("root artifact roles must match the exact digest domain")
+    for role in sorted(REQUIRED_ROOT_ARTIFACT_ROLES):
+        digest = artifacts[role]
+        if type(digest) is not dict or set(digest) != {"bytes", "sha256"}:
+            raise ValueError(f"root artifact {role} must be an exact digest")
+        _digest_payload(digest, label=f"root artifact {role}")
+
+    holdout_groups = root_manifest["holdout_groups"]
+    canonical_holdouts = _canonical_holdout_groups(holdout_groups)
+    if holdout_groups != canonical_holdouts:
+        raise ValueError("root manifest requires canonical holdout order")
+
+
 def build_root_manifest(
     *,
     execution_id: str,
@@ -566,8 +836,11 @@ def build_root_manifest(
 ) -> dict[str, Any]:
     """Create the exact root digest domain; runtime artifacts are not accepted."""
 
-    if type(execution_id) is not str or OPAQUE_ID_PATTERN.fullmatch(execution_id) is None:
-        raise ValueError("execution_id must be a canonical opaque ID")
+    if (
+        type(execution_id) is not str
+        or EXECUTION_BUNDLE_ID_PATTERN.fullmatch(execution_id) is None
+    ):
+        raise ValueError("execution_id must be a machine-generated opaque ID")
     created = _utc_timestamp(created_at_utc, label="created_at_utc")
     expires = _utc_timestamp(expires_at_utc, label="expires_at_utc")
     if expires <= created:
@@ -597,11 +870,13 @@ def build_root_manifest(
         "artifacts": artifact_digests,
         "holdout_groups": _canonical_holdout_groups(holdout_groups),
     }
+    _validate_serialized_root_manifest(manifest)
     canonical_json_bytes(manifest)
     return manifest
 
 
 def compute_bundle_id(root_manifest: dict[str, Any]) -> str:
-    if "bundle_id" in root_manifest:
+    if type(root_manifest) is dict and "bundle_id" in root_manifest:
         raise ValueError("bundle_id must not be serialized into its digest domain")
+    _validate_serialized_root_manifest(root_manifest)
     return hashlib.sha256(canonical_json_bytes(root_manifest)).hexdigest()
