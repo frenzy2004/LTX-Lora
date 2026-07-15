@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import copy
+from dataclasses import replace
 import hashlib
 import importlib.util
 from importlib import import_module
@@ -21,6 +22,7 @@ from ltx_lora_pilot.artifacts import (
     canonical_json_bytes,
     sha256_file,
 )
+from ltx_lora_pilot.pilot_ledger import LedgerPreflightSnapshot
 
 
 FIXED_TIME = "2026-07-15T02:00:00Z"
@@ -30,6 +32,7 @@ ISSUER_PROCESS_ID = "process_00000000000040008000000000000003"
 PILOT_ID = "pilot_00000000000040008000000000000004"
 LEDGER_ID = "ledger_00000000000040008000000000000005"
 EXECUTION_ID = "exec_00000000000040008000000000000006"
+LEDGER_HEAD_SHA256 = "a" * 64
 ENDPOINT = "fal-ai/ltx23-trainer-v2/a2v"
 OFFICIAL_PRICE_URL = "https://fal.ai/models/fal-ai/ltx23-trainer-v2/a2v"
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,11 +45,43 @@ SYNTHETIC_REPORT = {"schema_version": "synthetic-report-v1"}
 SYNTHETIC_SELECTION = {"schema_version": "synthetic-selection-v1"}
 
 
+class _AuthorizationTestApi:
+    def __init__(self, module: Any) -> None:
+        self._module = module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._module, name)
+
+    def issue_execution_receipt(self, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("read_ledger_snapshot", matching_snapshot_reader)
+        return self._module.issue_execution_receipt(*args, **kwargs)
+
+
 def _api() -> Any:
     try:
-        return import_module("ltx_lora_pilot.authorization")
+        return _AuthorizationTestApi(
+            import_module("ltx_lora_pilot.authorization")
+        )
     except (ImportError, AttributeError) as exc:
         pytest.fail(f"authorization API is unavailable: {exc}")
+
+
+def matching_snapshot_reader(
+    pilot_id: str,
+    ledger_id: str,
+    bundle_id: str,
+    execution_id: str,
+) -> LedgerPreflightSnapshot:
+    return LedgerPreflightSnapshot(
+        pilot_id=pilot_id,
+        ledger_id=ledger_id,
+        bundle_id=bundle_id,
+        execution_id=execution_id,
+        head_sha256=LEDGER_HEAD_SHA256,
+        committed_usd="3.5409",
+        remaining_usd="8.4591",
+        replay_detected=False,
+    )
 
 
 def _load_script(path: Path) -> Any:
@@ -275,6 +310,25 @@ def _write_bundle(
     return run_dir, root_manifest, compute_bundle_id(root_manifest)
 
 
+def _write_canonical_private_bundle(
+    private_root: Path,
+) -> tuple[Path, dict[str, Any], str, Path]:
+    run_dir, root_manifest, bundle_id = _write_bundle(
+        private_root,
+        name=f"pilots/{PILOT_ID}/runs/{EXECUTION_ID}",
+    )
+    ledger_path = (
+        private_root
+        / "pilots"
+        / PILOT_ID
+        / "ledger"
+        / "pilot.sqlite3"
+    )
+    ledger_path.parent.mkdir(parents=True)
+    ledger_path.write_bytes(b"synthetic ledger path placeholder")
+    return run_dir, root_manifest, bundle_id, ledger_path
+
+
 def test_valid_policy_round_trips_exactly() -> None:
     authorization = _api().StandingAuthorization.from_dict(
         valid_policy(), now=FIXED_TIME
@@ -346,6 +400,214 @@ def test_policy_rejects_expiry_and_noncanonical_time() -> None:
         )
 
 
+def test_v2_receipt_binds_one_fresh_verified_ledger_snapshot(
+    tmp_path: Path,
+) -> None:
+    run_dir, root_manifest, bundle_id = _write_bundle(tmp_path)
+    calls: list[tuple[str, str, str, str]] = []
+
+    def read_snapshot(
+        pilot_id: str,
+        ledger_id: str,
+        requested_bundle_id: str,
+        execution_id: str,
+    ) -> LedgerPreflightSnapshot:
+        calls.append((pilot_id, ledger_id, requested_bundle_id, execution_id))
+        assert requested_bundle_id == compute_bundle_id(root_manifest)
+        return matching_snapshot_reader(
+            pilot_id,
+            ledger_id,
+            requested_bundle_id,
+            execution_id,
+        )
+
+    receipt = _api().issue_execution_receipt(
+        valid_policy(),
+        run_dir,
+        expected_bundle_id=bundle_id,
+        read_ledger_snapshot=read_snapshot,
+        approval_id=APPROVAL_ID,
+        issuer_process_id=ISSUER_PROCESS_ID,
+        now=FIXED_TIME,
+    )
+
+    assert calls == [(PILOT_ID, LEDGER_ID, bundle_id, EXECUTION_ID)]
+    assert receipt.schema_version == "a2v-execution-approval-v2"
+    assert receipt.ledger_head_sha256 == LEDGER_HEAD_SHA256
+    assert "committed_usd" not in receipt.to_dict()
+    assert "remaining_usd" not in receipt.to_dict()
+    assert "replay_detected" not in receipt.to_dict()
+
+
+def test_snapshot_reader_is_required_and_not_called_before_bundle_validation(
+    tmp_path: Path,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(tmp_path)
+    authorization = import_module("ltx_lora_pilot.authorization")
+
+    with pytest.raises(TypeError, match="read_ledger_snapshot"):
+        authorization.issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+    (run_dir / "plan.md").write_bytes(b"tampered plan")
+    calls = 0
+
+    def unexpected_reader(*args: str) -> LedgerPreflightSnapshot:
+        nonlocal calls
+        calls += 1
+        return matching_snapshot_reader(*args)
+
+    with pytest.raises(ValueError, match="plan root binding mismatch"):
+        authorization.issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            read_ledger_snapshot=unexpected_reader,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+    assert calls == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pilot_id", "pilot_00000000000040008000000000000007"),
+        ("ledger_id", "ledger_00000000000040008000000000000008"),
+        ("bundle_id", "b" * 64),
+        ("execution_id", "exec_00000000000040008000000000000009"),
+    ],
+)
+def test_receipt_rejects_every_ledger_snapshot_identity_mismatch(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(tmp_path)
+
+    def read_snapshot(*args: str) -> LedgerPreflightSnapshot:
+        return replace(matching_snapshot_reader(*args), **{field: value})
+
+    with pytest.raises(
+        ValueError,
+        match=rf"ledger preflight snapshot {field} mismatch",
+    ):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            read_ledger_snapshot=read_snapshot,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize("replay_detected", [True, "false", 1])
+def test_receipt_rejects_replayed_or_invalid_ledger_snapshot(
+    tmp_path: Path,
+    replay_detected: Any,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(tmp_path)
+
+    def replayed(*args: str) -> LedgerPreflightSnapshot:
+        return replace(
+            matching_snapshot_reader(*args),
+            replay_detected=replay_detected,
+        )
+
+    message = (
+        "ledger preflight snapshot detected replay"
+        if replay_detected is True
+        else "ledger preflight snapshot replay flag is invalid"
+    )
+    with pytest.raises(ValueError, match=message):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            read_ledger_snapshot=replayed,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+    with pytest.raises(ValueError, match="ledger preflight snapshot is invalid"):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            read_ledger_snapshot=lambda *_args: object(),  # type: ignore[arg-type]
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+def test_snapshot_reader_failure_is_called_once_and_propagated_after_bundle_load(
+    tmp_path: Path,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(tmp_path)
+    calls = 0
+
+    class SnapshotReadFailed(RuntimeError):
+        pass
+
+    def fail_reader(*_args: str) -> LedgerPreflightSnapshot:
+        nonlocal calls
+        calls += 1
+        raise SnapshotReadFailed("synthetic snapshot read failure")
+
+    with pytest.raises(SnapshotReadFailed, match="synthetic snapshot read failure"):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            read_ledger_snapshot=fail_reader,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+    assert calls == 1
+
+
+@pytest.mark.parametrize("ledger_head", ["A" * 64, "not-a-hash"])
+def test_receipt_rejects_noncanonical_ledger_head(
+    tmp_path: Path,
+    ledger_head: str,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(tmp_path)
+
+    def read_snapshot(*args: str) -> LedgerPreflightSnapshot:
+        return replace(
+            matching_snapshot_reader(*args),
+            head_sha256=ledger_head,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="ledger_head_sha256 must be a lowercase SHA-256",
+    ):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            read_ledger_snapshot=read_snapshot,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
 def test_receipt_uses_exact_structured_approval_schema(tmp_path: Path) -> None:
     run_dir, root_manifest, bundle_id = _write_bundle(tmp_path)
 
@@ -376,12 +638,14 @@ def test_receipt_uses_exact_structured_approval_schema(tmp_path: Path) -> None:
         "execution_config_sha256",
         "pilot_id",
         "ledger_id",
+        "ledger_head_sha256",
         "training_max_usd",
         "validation_allocation_usd",
         "cumulative_cap_usd",
         "steps",
     }
-    assert receipt.schema_version == "a2v-execution-approval-v1"
+    assert receipt.schema_version == "a2v-execution-approval-v2"
+    assert receipt.ledger_head_sha256 == LEDGER_HEAD_SHA256
     assert receipt.status == "approved_for_paid_execution"
     assert receipt.approval_mode == "standing_policy"
     assert receipt.bundle_id == compute_bundle_id(root_manifest)
@@ -972,6 +1236,43 @@ def test_receipt_rejects_unknown_fields_and_expiry(tmp_path: Path) -> None:
             run_dir,
             now="2026-07-15T20:00:01Z",
         )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["v1", "missing_head", "extra_head", "uppercase", "malformed"],
+)
+def test_receipt_parser_requires_exact_v2_ledger_head_schema(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(tmp_path)
+    serialized = _api().issue_execution_receipt(
+        valid_policy(),
+        run_dir,
+        expected_bundle_id=bundle_id,
+        approval_id=APPROVAL_ID,
+        issuer_process_id=ISSUER_PROCESS_ID,
+        now=FIXED_TIME,
+    ).to_dict()
+    if mutation == "v1":
+        serialized["schema_version"] = "a2v-execution-approval-v1"
+        message = "execution approval schema mismatch"
+    elif mutation == "missing_head":
+        del serialized["ledger_head_sha256"]
+        message = "execution approval must contain the exact fields"
+    elif mutation == "extra_head":
+        serialized["ledger_head_copy"] = LEDGER_HEAD_SHA256
+        message = "execution approval must contain the exact fields"
+    elif mutation == "uppercase":
+        serialized["ledger_head_sha256"] = "A" * 64
+        message = "ledger_head_sha256 must be a lowercase SHA-256"
+    else:
+        serialized["ledger_head_sha256"] = "not-a-hash"
+        message = "ledger_head_sha256 must be a lowercase SHA-256"
+
+    with pytest.raises(ValueError, match=message):
+        _api().ExecutionReceipt.from_dict(serialized, now=FIXED_TIME)
 
 
 def test_receipt_hashes_are_the_exact_bound_artifacts(tmp_path: Path) -> None:
@@ -1904,19 +2205,90 @@ def test_issuer_writes_once_and_has_no_paid_capabilities(
 ) -> None:
     from ltx_lora_pilot import budget, fal_api
 
-    run_dir, _, bundle_id = _write_bundle(tmp_path)
+    run_dir, _, bundle_id, ledger_path = _write_canonical_private_bundle(
+        tmp_path
+    )
     issuer = _load_script(ISSUE_SCRIPT)
+    from ltx_lora_pilot.private_workspace import (
+        approved_private_root_from_environment,
+    )
+    observations: dict[str, Any] = {
+        "root_loads": 0,
+        "environment_reads": [],
+        "ledger_opens": [],
+        "snapshots": [],
+    }
+
+    class ReadOnlyLedger:
+        def preflight_snapshot(
+            self,
+            requested_bundle_id: str,
+            execution_id: str,
+        ) -> LedgerPreflightSnapshot:
+            observations["snapshots"].append(
+                (requested_bundle_id, execution_id)
+            )
+            return matching_snapshot_reader(
+                PILOT_ID,
+                LEDGER_ID,
+                requested_bundle_id,
+                execution_id,
+            )
+
+    class ReadOnlyPilotLedger:
+        @staticmethod
+        def open_existing(
+            path: Path,
+            expected_pilot_id: str,
+            *,
+            expected_ledger_id: str,
+        ) -> ReadOnlyLedger:
+            observations["ledger_opens"].append(
+                (path, expected_pilot_id, expected_ledger_id)
+            )
+            return ReadOnlyLedger()
+
+    def load_root_once() -> Path:
+        observations["root_loads"] += 1
+        return approved_private_root_from_environment()
 
     def forbidden(*_args: Any, **_kwargs: Any) -> Any:
         raise AssertionError("paid or external capability was accessed")
 
     monkeypatch.setenv("FAL_KEY", "SYNTHETIC-KEY-MUST-NOT-BE-READ")
+    monkeypatch.setenv("LTX_LORA_PRIVATE_ROOT", str(tmp_path.resolve()))
+    environment_type = type(os.environ)
+    original_environment_get = environment_type.get
+
+    def guarded_environment_get(
+        environment: Any,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+        observations["environment_reads"].append(key)
+        if key != "LTX_LORA_PRIVATE_ROOT":
+            raise AssertionError("credential environment was accessed")
+        return original_environment_get(environment, key, default)
+
+    monkeypatch.setattr(environment_type, "get", guarded_environment_get)
     monkeypatch.setattr(os, "getenv", forbidden)
     monkeypatch.setattr(urllib.request, "urlopen", forbidden)
     monkeypatch.setattr(fal_api, "upload", forbidden)
     monkeypatch.setattr(fal_api, "submit", forbidden)
     monkeypatch.setattr(budget.BudgetLedger, "__init__", forbidden)
     monkeypatch.setattr(budget.BudgetLedger, "reserve", forbidden)
+    monkeypatch.setattr(
+        issuer,
+        "approved_private_root_from_environment",
+        load_root_once,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        issuer,
+        "PilotLedger",
+        ReadOnlyPilotLedger,
+        raising=False,
+    )
 
     receipt = issuer._issue(
         run_dir,
@@ -1928,6 +2300,12 @@ def test_issuer_writes_once_and_has_no_paid_capabilities(
 
     approval_path = run_dir / "control" / "execution-approval.json"
     assert approval_path.read_bytes() == canonical_json_bytes(receipt.to_dict())
+    assert observations == {
+        "root_loads": 1,
+        "environment_reads": ["LTX_LORA_PRIVATE_ROOT"],
+        "ledger_opens": [(ledger_path.resolve(), PILOT_ID, LEDGER_ID)],
+        "snapshots": [(bundle_id, EXECUTION_ID)],
+    }
     assert _api().verify_execution_receipt(
         json.loads(approval_path.read_text("utf-8")),
         valid_policy(),
@@ -1949,18 +2327,112 @@ def test_issuer_writes_once_and_has_no_paid_capabilities(
         "ltx_lora_pilot.fal_api",
         "ltx_lora_pilot.budget",
         "BudgetLedger",
+        "FAL_KEY",
+        "reserve_training",
+        ".reserve(",
+        ".transition(",
+        ".reconcile(",
         "upload",
         "submit",
     ):
         assert prohibited not in issuer_source
 
 
+def test_issuer_rejects_noncanonical_run_before_reading_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_root = tmp_path / "private"
+    private_root.mkdir()
+    outside_run, _, bundle_id = _write_bundle(tmp_path / "outside")
+    issuer = _load_script(ISSUE_SCRIPT)
+    bundle_reads = 0
+
+    def unexpected_policy_read(_path: Path) -> dict[str, object]:
+        nonlocal bundle_reads
+        bundle_reads += 1
+        raise AssertionError("bundle was read before run path authorization")
+
+    monkeypatch.setenv(
+        "LTX_LORA_PRIVATE_ROOT",
+        str(private_root.resolve()),
+    )
+    monkeypatch.setattr(issuer, "_load_policy", unexpected_policy_read)
+
+    with pytest.raises(ValueError, match="canonical run directory is required"):
+        issuer._issue(
+            outside_run.resolve(),
+            bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+    assert bundle_reads == 0
+
+
+def test_issuer_has_no_cwd_private_root_or_ledger_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, _, bundle_id, _ = _write_canonical_private_bundle(tmp_path)
+    issuer = _load_script(ISSUE_SCRIPT)
+    monkeypatch.delenv("LTX_LORA_PRIVATE_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="approved private root is required"):
+        issuer._issue(
+            run_dir.relative_to(tmp_path),
+            bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+    source = ISSUE_SCRIPT.read_text(encoding="utf-8")
+    assert "--private-root" not in source
+    assert "--ledger" not in source
+    assert "Path.cwd" not in source
+
+
 def test_concurrent_issuers_publish_exactly_one_complete_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run_dir, _, bundle_id = _write_bundle(tmp_path)
+    run_dir, _, bundle_id, _ = _write_canonical_private_bundle(tmp_path)
     issuer = _load_script(ISSUE_SCRIPT)
+    monkeypatch.setenv("LTX_LORA_PRIVATE_ROOT", str(tmp_path.resolve()))
+
+    class ReadOnlyLedger:
+        def preflight_snapshot(
+            self,
+            requested_bundle_id: str,
+            execution_id: str,
+        ) -> LedgerPreflightSnapshot:
+            return matching_snapshot_reader(
+                PILOT_ID,
+                LEDGER_ID,
+                requested_bundle_id,
+                execution_id,
+            )
+
+    class ReadOnlyPilotLedger:
+        @staticmethod
+        def open_existing(
+            _path: Path,
+            _expected_pilot_id: str,
+            *,
+            expected_ledger_id: str,
+        ) -> ReadOnlyLedger:
+            assert expected_ledger_id == LEDGER_ID
+            return ReadOnlyLedger()
+
+    monkeypatch.setattr(
+        issuer,
+        "PilotLedger",
+        ReadOnlyPilotLedger,
+        raising=False,
+    )
     original_issue = issuer.issue_execution_receipt
     publication_barrier = threading.Barrier(2)
 

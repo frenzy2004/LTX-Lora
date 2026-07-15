@@ -19,6 +19,7 @@ from .artifacts import (
     sha256_file,
     strict_load_json,
 )
+from .pilot_ledger import LedgerPreflightSnapshot
 
 
 A2V_ENDPOINT = "fal-ai/ltx23-trainer-v2/a2v"
@@ -29,7 +30,7 @@ A2V_RATE_USD_PER_STEP = "0.006"
 TRAINING_MAX_USD = "6.0000"
 VALIDATION_ALLOCATION_MAX_USD = "1.2500"
 CUMULATIVE_CAP_USD = "12.0000"
-APPROVAL_SCHEMA_VERSION = "a2v-execution-approval-v1"
+APPROVAL_SCHEMA_VERSION = "a2v-execution-approval-v2"
 APPROVAL_STATUS = "approved_for_paid_execution"
 APPROVAL_MODE = "standing_policy"
 EXECUTION_CONFIG_SCHEMA_VERSION = "a2v-execution-config-v1"
@@ -93,6 +94,7 @@ EXECUTION_RECEIPT_FIELDS = frozenset(
         "execution_config_sha256",
         "pilot_id",
         "ledger_id",
+        "ledger_head_sha256",
         "training_max_usd",
         "validation_allocation_usd",
         "cumulative_cap_usd",
@@ -871,6 +873,7 @@ class ExecutionReceipt:
     execution_config_sha256: str
     pilot_id: str
     ledger_id: str
+    ledger_head_sha256: str
     training_max_usd: str
     validation_allocation_usd: str
     cumulative_cap_usd: str
@@ -916,6 +919,7 @@ class ExecutionReceipt:
             "dataset_manifest_sha256",
             "training_archive_sha256",
             "execution_config_sha256",
+            "ledger_head_sha256",
         ):
             _sha256(data[field], label=field)
         issued = _parse_utc_timestamp(data["issued_at_utc"], label="issued_at_utc")
@@ -955,6 +959,12 @@ class _BundleFacts:
     execution_config_sha256: str
     pilot_id: str
     ledger_id: str
+
+
+LedgerSnapshotReader = Callable[
+    [str, str, str, str],
+    LedgerPreflightSnapshot,
+]
 
 
 def _is_symlink_or_junction(path: Path) -> bool:
@@ -1188,10 +1198,39 @@ def _new_typed_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+def _ledger_head_for_receipt(
+    facts: _BundleFacts,
+    read_ledger_snapshot: LedgerSnapshotReader,
+) -> str:
+    snapshot = read_ledger_snapshot(
+        facts.pilot_id,
+        facts.ledger_id,
+        facts.bundle_id,
+        facts.execution_id,
+    )
+    if not isinstance(snapshot, LedgerPreflightSnapshot):
+        raise ValueError("ledger preflight snapshot is invalid")
+    expected_identities = {
+        "pilot_id": facts.pilot_id,
+        "ledger_id": facts.ledger_id,
+        "bundle_id": facts.bundle_id,
+        "execution_id": facts.execution_id,
+    }
+    for field, expected in expected_identities.items():
+        if getattr(snapshot, field) != expected:
+            raise ValueError(f"ledger preflight snapshot {field} mismatch")
+    if type(snapshot.replay_detected) is not bool:
+        raise ValueError("ledger preflight snapshot replay flag is invalid")
+    if snapshot.replay_detected:
+        raise ValueError("ledger preflight snapshot detected replay")
+    return _sha256(snapshot.head_sha256, label="ledger_head_sha256")
+
+
 def issue_execution_receipt(
     policy: Mapping[str, Any] | StandingAuthorization,
     bundle: str | Path,
     *,
+    read_ledger_snapshot: LedgerSnapshotReader,
     expected_bundle_id: str | None = None,
     approval_id: str | None = None,
     issuer_process_id: str | None = None,
@@ -1203,6 +1242,10 @@ def issue_execution_receipt(
         bundle,
         expected_bundle_id=expected_bundle_id,
         now=current,
+    )
+    ledger_head_sha256 = _ledger_head_for_receipt(
+        facts,
+        read_ledger_snapshot,
     )
     selected_approval_id = approval_id or _new_typed_id("approval")
     selected_process_id = issuer_process_id or _new_typed_id("process")
@@ -1226,6 +1269,7 @@ def issue_execution_receipt(
         "execution_config_sha256": facts.execution_config_sha256,
         "pilot_id": facts.pilot_id,
         "ledger_id": facts.ledger_id,
+        "ledger_head_sha256": ledger_head_sha256,
         "training_max_usd": facts.policy.training_max_usd,
         "validation_allocation_usd": facts.policy.validation_allocation_usd,
         "cumulative_cap_usd": facts.policy.cumulative_cap_usd,
