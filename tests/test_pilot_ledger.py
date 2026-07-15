@@ -16,7 +16,12 @@ import pytest
 
 import ltx_lora_pilot.pilot_ledger as pilot_ledger
 from ltx_lora_pilot.artifacts import canonical_json_bytes
-from ltx_lora_pilot.pilot_ledger import PilotLedger, Reservation, migrate_legacy_ledger
+from ltx_lora_pilot.pilot_ledger import (
+    LedgerPreflightSnapshot,
+    PilotLedger,
+    Reservation,
+    migrate_legacy_ledger,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,6 +127,390 @@ def _migrate_fixture(tmp_path: Path) -> tuple[PilotLedger, Path, Path, Path]:
     source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
     ledger = migrate_legacy_ledger(source_path, manifest_path, ledger_path)
     return ledger, source_path, manifest_path, ledger_path
+
+
+def test_preflight_snapshot_is_one_verified_read_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, _ = _migrate_fixture(tmp_path)
+    bundle_id = _bundle_id(100)
+    execution_id = _typed_id("exec", 100)
+    expected_head = ledger.head_hash
+    original_read_connection = pilot_ledger._read_connection
+    observed = {"read_transactions": 0}
+
+    @contextmanager
+    def counted_read_connection(path: Path) -> Any:
+        observed["read_transactions"] += 1
+        with original_read_connection(path) as connection:
+            yield connection
+
+    monkeypatch.setattr(pilot_ledger, "_read_connection", counted_read_connection)
+
+    def unexpected_component_snapshot() -> Any:
+        raise AssertionError("separate ledger accessor was called")
+
+    monkeypatch.setattr(ledger, "_snapshot", unexpected_component_snapshot)
+
+    snapshot = ledger.preflight_snapshot(bundle_id, execution_id)
+
+    assert observed == {"read_transactions": 1}
+    assert snapshot == LedgerPreflightSnapshot(
+        pilot_id=PILOT_ID,
+        ledger_id=LEDGER_ID,
+        bundle_id=bundle_id,
+        execution_id=execution_id,
+        head_sha256=expected_head,
+        committed_usd="3.5409",
+        remaining_usd="8.4591",
+        replay_detected=False,
+    )
+
+
+def test_ledger_preflight_snapshot_is_a_public_export() -> None:
+    assert "LedgerPreflightSnapshot" in pilot_ledger.__all__
+
+
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+def test_preflight_snapshot_rejects_sidecar_before_opening_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    sidecar = Path(f"{ledger_path}{suffix}")
+    sidecar.write_bytes(b"synthetic untrusted sidecar")
+
+    def unexpected_open(path: Path) -> Any:
+        del path
+        raise AssertionError("database opened before sidecar rejection")
+
+    monkeypatch.setattr(pilot_ledger, "_read_connection", unexpected_open)
+
+    with pytest.raises(ValueError, match="ledger sidecar exists"):
+        ledger.preflight_snapshot(_bundle_id(100), _typed_id("exec", 100))
+
+    assert sidecar.read_bytes() == b"synthetic untrusted sidecar"
+
+
+@pytest.mark.parametrize("suffix", ["-journal", "-wal", "-shm"])
+def test_preflight_snapshot_rechecks_sidecar_absence_before_returning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    sidecar = Path(f"{ledger_path}{suffix}")
+    original_verify = pilot_ledger._verify_connection
+
+    def verify_then_create_sidecar(*args: Any, **kwargs: Any) -> Any:
+        snapshot = original_verify(*args, **kwargs)
+        sidecar.write_bytes(b"synthetic sidecar race")
+        return snapshot
+
+    monkeypatch.setattr(pilot_ledger, "_verify_connection", verify_then_create_sidecar)
+
+    with pytest.raises(ValueError, match="ledger sidecar exists"):
+        ledger.preflight_snapshot(_bundle_id(100), _typed_id("exec", 100))
+
+    assert sidecar.read_bytes() == b"synthetic sidecar race"
+
+
+def test_preflight_snapshot_rechecks_sidecars_after_retaining_file_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    sidecar = Path(f"{ledger_path}-journal")
+    original_anchor = pilot_ledger._preflight_file_anchor
+
+    @contextmanager
+    def anchor_then_create_sidecar(path: Path) -> Any:
+        with original_anchor(path) as values:
+            sidecar.write_bytes(b"synthetic anchor race")
+            yield values
+
+    def unexpected_open(path: Path) -> Any:
+        del path
+        raise AssertionError("database opened after sidecar appeared")
+
+    monkeypatch.setattr(
+        pilot_ledger,
+        "_preflight_file_anchor",
+        anchor_then_create_sidecar,
+    )
+    monkeypatch.setattr(pilot_ledger, "_read_connection", unexpected_open)
+
+    with pytest.raises(ValueError, match="ledger sidecar exists"):
+        ledger.preflight_snapshot(_bundle_id(100), _typed_id("exec", 100))
+
+    assert sidecar.read_bytes() == b"synthetic anchor race"
+
+
+def test_preflight_snapshot_rejects_database_metadata_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    original_verify = pilot_ledger._verify_connection
+
+    def verify_then_touch_database(*args: Any, **kwargs: Any) -> Any:
+        snapshot = original_verify(*args, **kwargs)
+        current = ledger_path.stat()
+        os.utime(
+            ledger_path,
+            ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000_000),
+        )
+        return snapshot
+
+    monkeypatch.setattr(pilot_ledger, "_verify_connection", verify_then_touch_database)
+
+    with pytest.raises(ValueError, match="ledger changed during verification"):
+        ledger.preflight_snapshot(_bundle_id(100), _typed_id("exec", 100))
+
+
+def test_preflight_snapshot_rejects_same_inode_database_byte_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    original_read_connection = pilot_ledger._read_connection
+    original_identity = (ledger_path.stat().st_dev, ledger_path.stat().st_ino)
+
+    @contextmanager
+    def mutate_after_read_transaction(path: Path) -> Any:
+        with original_read_connection(path) as connection:
+            yield connection
+        current = path.stat()
+        with path.open("r+b") as handle:
+            handle.seek(-1, os.SEEK_END)
+            final_byte = handle.read(1)
+            handle.seek(-1, os.SEEK_END)
+            handle.write(bytes([final_byte[0] ^ 1]))
+        os.utime(path, ns=(current.st_atime_ns, current.st_mtime_ns))
+
+    monkeypatch.setattr(
+        pilot_ledger,
+        "_read_connection",
+        mutate_after_read_transaction,
+    )
+
+    with pytest.raises(ValueError, match="ledger changed during verification"):
+        ledger.preflight_snapshot(_bundle_id(100), _typed_id("exec", 100))
+
+    assert (ledger_path.stat().st_dev, ledger_path.stat().st_ino) == original_identity
+
+
+def test_preflight_snapshot_rejects_path_replacement_after_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    original_read_connection = pilot_ledger._read_connection
+    original_stat = Path.stat
+    observed = {"replacement_visible": False}
+
+    @contextmanager
+    def replace_after_read_transaction(path: Path) -> Any:
+        with original_read_connection(path) as connection:
+            yield connection
+        observed["replacement_visible"] = True
+
+    def stat_with_replaced_identity(path: Path, *args: Any, **kwargs: Any) -> os.stat_result:
+        result = original_stat(path, *args, **kwargs)
+        if path == ledger_path and observed["replacement_visible"]:
+            values = list(result)
+            values[1] += 1
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(
+        pilot_ledger,
+        "_read_connection",
+        replace_after_read_transaction,
+    )
+    monkeypatch.setattr(Path, "stat", stat_with_replaced_identity)
+
+    with pytest.raises(ValueError, match="ledger changed during verification"):
+        ledger.preflight_snapshot(_bundle_id(100), _typed_id("exec", 100))
+
+    assert observed == {"replacement_visible": True}
+
+
+@pytest.mark.parametrize("replay_field", ["bundle", "execution"])
+def test_preflight_snapshot_reports_replay_without_private_row_details(
+    tmp_path: Path,
+    replay_field: str,
+) -> None:
+    ledger, _, _, _ = _migrate_fixture(tmp_path)
+    reserved = ledger.reserve(
+        _bundle_id(100),
+        _typed_id("exec", 100),
+        Decimal("0.1000"),
+    )
+    bundle_id = reserved.bundle_id if replay_field == "bundle" else _bundle_id(101)
+    execution_id = (
+        reserved.execution_id
+        if replay_field == "execution"
+        else _typed_id("exec", 101)
+    )
+
+    snapshot = ledger.preflight_snapshot(bundle_id, execution_id)
+
+    assert snapshot.replay_detected is True
+    assert snapshot.bundle_id == bundle_id
+    assert snapshot.execution_id == execution_id
+    assert not hasattr(snapshot, "reservation_id")
+    assert not hasattr(snapshot, "state")
+
+
+@pytest.mark.parametrize("wrong_identity", ["pilot", "ledger"])
+def test_preflight_snapshot_rejects_wrong_open_identity(
+    tmp_path: Path,
+    wrong_identity: str,
+) -> None:
+    _, _, _, ledger_path = _migrate_fixture(tmp_path)
+    wrong_pilot = _typed_id("pilot", 900)
+    wrong_ledger = _typed_id("ledger", 901)
+    ledger = PilotLedger(
+        ledger_path,
+        wrong_pilot if wrong_identity == "pilot" else PILOT_ID,
+        wrong_ledger if wrong_identity == "ledger" else LEDGER_ID,
+    )
+
+    with pytest.raises(ValueError, match=f"{wrong_identity} identity mismatch"):
+        ledger.preflight_snapshot(_bundle_id(100), _typed_id("exec", 100))
+
+
+def test_preflight_snapshot_rejects_corrupt_event_chain(tmp_path: Path) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    recreate_trigger = next(
+        statement
+        for statement in pilot_ledger.TRIGGER_STATEMENTS
+        if "CREATE TRIGGER events_no_update" in statement
+    )
+    with closing(sqlite3.connect(ledger_path)) as connection, connection:
+        connection.execute("DROP TRIGGER events_no_update")
+        connection.execute(
+            "UPDATE events SET event_hash = ? WHERE event_index = 1",
+            ("0" * 64,),
+        )
+        connection.execute(recreate_trigger)
+
+    with pytest.raises(ValueError, match="event chain mismatch"):
+        ledger.preflight_snapshot(_bundle_id(100), _typed_id("exec", 100))
+
+
+def test_reserve_training_requires_expected_head(tmp_path: Path) -> None:
+    ledger, _, _, _ = _migrate_fixture(tmp_path)
+
+    with pytest.raises(TypeError, match="expected_head_sha256"):
+        ledger.reserve_training(  # type: ignore[call-arg]
+            _bundle_id(100),
+            _typed_id("exec", 100),
+            Decimal("1.0000"),
+        )
+
+    assert ledger.remaining() == Decimal("8.4591")
+
+
+@pytest.mark.parametrize("expected_head", ["not-a-hash", "A" * 64])
+def test_reserve_training_rejects_malformed_head_before_write_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_head: str,
+) -> None:
+    ledger, _, _, _ = _migrate_fixture(tmp_path)
+
+    def unexpected_write_connection(path: Path) -> Any:
+        del path
+        raise AssertionError("write connection opened before head validation")
+
+    monkeypatch.setattr(
+        pilot_ledger,
+        "_write_connection",
+        unexpected_write_connection,
+    )
+
+    with pytest.raises(ValueError, match="expected ledger head must be a lowercase SHA-256"):
+        ledger.reserve_training(
+            _bundle_id(100),
+            _typed_id("exec", 100),
+            Decimal("1.0000"),
+            expected_head_sha256=expected_head,
+        )
+
+
+def test_reserve_training_rejects_changed_ledger_head_without_rows(
+    tmp_path: Path,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    bundle_id = _bundle_id(100)
+    execution_id = _typed_id("exec", 100)
+    snapshot = ledger.preflight_snapshot(bundle_id, execution_id)
+    ledger.reserve(
+        _bundle_id(101),
+        _typed_id("exec", 101),
+        Decimal("0.1000"),
+    )
+
+    with pytest.raises(RuntimeError, match="ledger head changed after approval"):
+        ledger.reserve_training(
+            bundle_id,
+            execution_id,
+            Decimal("1.0000"),
+            expected_head_sha256=snapshot.head_sha256,
+        )
+
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        reservation = connection.execute(
+            "SELECT 1 FROM reservations WHERE bundle_id = ? OR execution_id = ?",
+            (bundle_id, execution_id),
+        ).fetchone()
+    assert reservation is None
+
+
+def test_reserve_training_checks_head_after_begin_and_verify_before_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    bundle_id = _bundle_id(100)
+    execution_id = _typed_id("exec", 100)
+    snapshot = ledger.preflight_snapshot(bundle_id, execution_id)
+    ledger.reserve(
+        _bundle_id(101),
+        _typed_id("exec", 101),
+        Decimal("0.1000"),
+    )
+    statements: list[str] = []
+    original_connect = sqlite3.connect
+
+    def traced_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(pilot_ledger.sqlite3, "connect", traced_connect)
+
+    with pytest.raises(RuntimeError, match="ledger head changed after approval"):
+        ledger.reserve_training(
+            bundle_id,
+            execution_id,
+            Decimal("1.0000"),
+            expected_head_sha256=snapshot.head_sha256,
+        )
+
+    normalized = [" ".join(statement.upper().split()) for statement in statements]
+    begin_index = normalized.index("BEGIN IMMEDIATE")
+    verify_index = normalized.index("PRAGMA INTEGRITY_CHECK")
+    assert begin_index < verify_index
+    assert not any(statement.startswith("INSERT ") for statement in normalized)
+    assert all(
+        not Path(f"{ledger_path}{suffix}").exists()
+        for suffix in ("-journal", "-wal", "-shm")
+    )
 
 
 def _install_commit_then_disconnect(
@@ -2852,10 +3241,14 @@ def test_two_processes_cannot_overspend_remaining_budget(tmp_path: Path) -> None
 
 def test_complete_happy_path_is_durable_and_idempotent(tmp_path: Path) -> None:
     ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    bundle_id = _bundle_id(100)
+    execution_id = _typed_id("exec", 100)
+    snapshot = ledger.preflight_snapshot(bundle_id, execution_id)
     reservation = ledger.reserve_training(
-        _bundle_id(100),
-        _typed_id("exec", 100),
+        bundle_id,
+        execution_id,
         Decimal("1.0000"),
+        expected_head_sha256=snapshot.head_sha256,
     )
     initial_head = ledger.head_hash
 
@@ -3173,6 +3566,65 @@ def test_snapshot_allows_legitimate_process_commit_after_read_transaction(
             PILOT_ID,
             expected_ledger_id=LEDGER_ID,
         )
+        assert reopened.remaining() == Decimal("8.3591")
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+        process.close()
+        results.close()
+        results.join_thread()
+
+
+def test_preflight_snapshot_rejects_concurrent_commit_after_read_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    start = context.Event()
+    done = context.Event()
+    results = context.Queue()
+    process = context.Process(
+        target=_post_snapshot_commit_worker,
+        args=(str(ledger_path), ready, start, done, results),
+    )
+    original_read_connection = pilot_ledger._read_connection
+    triggered = False
+
+    @contextmanager
+    def commit_after_read_transaction(path: Path) -> Any:
+        nonlocal triggered
+        with original_read_connection(path) as connection:
+            yield connection
+        if not triggered:
+            triggered = True
+            start.set()
+            assert done.wait(30), "writer did not commit after the read transaction"
+
+    try:
+        process.start()
+        assert ready.wait(30), "writer did not open the ledger"
+        monkeypatch.setattr(
+            pilot_ledger,
+            "_read_connection",
+            commit_after_read_transaction,
+        )
+
+        with pytest.raises(ValueError, match="ledger changed during verification"):
+            ledger.preflight_snapshot(_bundle_id(100), _typed_id("exec", 100))
+
+        assert results.get(timeout=30)[0] == "reserved"
+        process.join(timeout=30)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+        reopened = PilotLedger.open_existing(
+            ledger_path,
+            PILOT_ID,
+            expected_ledger_id=LEDGER_ID,
+        )
+        assert reopened.verify_integrity() is True
         assert reopened.remaining() == Decimal("8.3591")
     finally:
         if process.is_alive():

@@ -112,6 +112,18 @@ class Reservation:
 
 
 @dataclass(frozen=True)
+class LedgerPreflightSnapshot:
+    pilot_id: str
+    ledger_id: str
+    bundle_id: str
+    execution_id: str
+    head_sha256: str
+    committed_usd: str
+    remaining_usd: str
+    replay_detected: bool
+
+
+@dataclass(frozen=True)
 class _IntegritySnapshot:
     committed: Decimal
     states: dict[str, str]
@@ -167,6 +179,19 @@ class _EventEffect:
             self.evidence_sha256,
             self.event_hash,
         )
+
+
+@dataclass(frozen=True)
+class _LedgerFileFingerprint:
+    identity: tuple[int, int]
+    mode: int
+    links: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+    file_attributes: int
+    reparse_tag: int
+    sha256: str
 
 
 TABLE_STATEMENTS = (
@@ -524,6 +549,14 @@ def _reject_destination_sidecars(destination: Path) -> None:
         raise ValueError("destination ledger sidecar exists")
 
 
+def _reject_ledger_sidecars(path: Path) -> None:
+    if any(
+        _path_entry_exists(Path(f"{path}{suffix}"))
+        for suffix in SQLITE_SIDECAR_SUFFIXES
+    ):
+        raise ValueError("ledger sidecar exists")
+
+
 def _preflight_destination_entries(destination: Path) -> None:
     if _path_entry_exists(destination):
         raise ValueError("destination ledger already exists")
@@ -547,6 +580,50 @@ def _canonical_destination(path: Path) -> Path:
 
 def _object_identity(stat_result: os.stat_result) -> tuple[int, int]:
     return stat_result.st_dev, stat_result.st_ino
+
+
+def _descriptor_sha256(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise ValueError("ledger changed during verification") from exc
+    return digest.hexdigest()
+
+
+def _descriptor_fingerprint(descriptor: int) -> _LedgerFileFingerprint:
+    try:
+        before = os.fstat(descriptor)
+        digest = _descriptor_sha256(descriptor)
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise ValueError("ledger changed during verification") from exc
+    before_metadata = (
+        _object_identity(before),
+        before.st_mode,
+        before.st_nlink,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        getattr(before, "st_file_attributes", 0),
+        getattr(before, "st_reparse_tag", 0),
+    )
+    after_metadata = (
+        _object_identity(after),
+        after.st_mode,
+        after.st_nlink,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        getattr(after, "st_file_attributes", 0),
+        getattr(after, "st_reparse_tag", 0),
+    )
+    if before_metadata != after_metadata:
+        raise ValueError("ledger changed during verification")
+    return _LedgerFileFingerprint(*after_metadata, sha256=digest)
 
 
 def _ensure_path_identity(
@@ -586,6 +663,42 @@ def _identity_anchor(path: Path) -> Iterator[os.stat_result]:
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+@contextmanager
+def _preflight_file_anchor(
+    path: Path,
+) -> Iterator[tuple[int, os.stat_result, _LedgerFileFingerprint]]:
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+            anchor = os.fstat(descriptor)
+        except OSError as exc:
+            raise ValueError("ledger changed during verification") from exc
+        _ensure_path_identity(path, anchor, expected_links=1)
+        fingerprint = _descriptor_fingerprint(descriptor)
+        yield descriptor, anchor, fingerprint
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _ensure_preflight_file_unchanged(
+    path: Path,
+    descriptor: int,
+    anchor: os.stat_result,
+    expected: _LedgerFileFingerprint,
+) -> None:
+    _ensure_path_identity(path, anchor, expected_links=1)
+    if _descriptor_fingerprint(descriptor) != expected:
+        raise ValueError("ledger changed during verification")
 
 
 def _load_manifest(path: Path) -> tuple[dict[str, Any], str]:
@@ -1470,6 +1583,55 @@ class PilotLedger:
         self._snapshot()
         return True
 
+    def preflight_snapshot(
+        self,
+        bundle_id: str,
+        execution_id: str,
+    ) -> LedgerPreflightSnapshot:
+        _bundle_identity(bundle_id)
+        _typed_id(execution_id, EXECUTION_ID_PATTERN, label="execution_id")
+        canonical = _canonical_existing_file(self.path, label="ledger database")
+        _reject_ledger_sidecars(canonical)
+        with _preflight_file_anchor(canonical) as (
+            descriptor,
+            anchor,
+            fingerprint,
+        ):
+            _reject_ledger_sidecars(canonical)
+            with _read_connection(canonical) as connection:
+                snapshot = _verify_connection(
+                    connection,
+                    expected_pilot_id=self._expected_pilot_id,
+                    expected_ledger_id=self._expected_ledger_id,
+                )
+                replay = connection.execute(
+                    """
+                    SELECT 1 FROM reservations
+                    WHERE bundle_id = ? OR execution_id = ?
+                    LIMIT 1
+                    """,
+                    (bundle_id, execution_id),
+                ).fetchone()
+                _ensure_path_identity(canonical, anchor, expected_links=1)
+                _reject_ledger_sidecars(canonical)
+            _ensure_preflight_file_unchanged(
+                canonical,
+                descriptor,
+                anchor,
+                fingerprint,
+            )
+            _reject_ledger_sidecars(canonical)
+        return LedgerPreflightSnapshot(
+            pilot_id=self._expected_pilot_id,
+            ledger_id=self._expected_ledger_id,
+            bundle_id=bundle_id,
+            execution_id=execution_id,
+            head_sha256=snapshot.head_hash,
+            committed_usd=f"{money(snapshot.committed):.4f}",
+            remaining_usd=f"{money(CAP_USD - snapshot.committed):.4f}",
+            replay_detected=replay is not None,
+        )
+
     def committed(self) -> Decimal:
         return money(self._snapshot().committed)
 
@@ -1497,6 +1659,21 @@ class PilotLedger:
         bundle_id: str,
         execution_id: str,
         amount_usd: Decimal | str,
+    ) -> Reservation:
+        return self._reserve(
+            bundle_id,
+            execution_id,
+            amount_usd,
+            expected_head_sha256=None,
+        )
+
+    def _reserve(
+        self,
+        bundle_id: str,
+        execution_id: str,
+        amount_usd: Decimal | str,
+        *,
+        expected_head_sha256: str | None,
     ) -> Reservation:
         _bundle_identity(bundle_id)
         _typed_id(execution_id, EXECUTION_ID_PATTERN, label="execution_id")
@@ -1526,6 +1703,11 @@ class PilotLedger:
                     expected_pilot_id=self._expected_pilot_id,
                     expected_ledger_id=self._expected_ledger_id,
                 )
+                if (
+                    expected_head_sha256 is not None
+                    and snapshot.head_hash != expected_head_sha256
+                ):
+                    raise RuntimeError("ledger head changed after approval")
                 replay = connection.execute(
                     """
                     SELECT 1 FROM reservations
@@ -1587,8 +1769,16 @@ class PilotLedger:
         bundle_id: str,
         execution_id: str,
         amount_usd: Decimal | str,
+        *,
+        expected_head_sha256: str,
     ) -> Reservation:
-        return self.reserve(bundle_id, execution_id, amount_usd)
+        _sha256(expected_head_sha256, label="expected ledger head")
+        return self._reserve(
+            bundle_id,
+            execution_id,
+            amount_usd,
+            expected_head_sha256=expected_head_sha256,
+        )
 
     def recover_reservation(
         self,
@@ -2148,6 +2338,7 @@ def migrate_legacy_ledger(
 __all__ = [
     "CAP_USD_TEXT",
     "COMMITTED_STATES",
+    "LedgerPreflightSnapshot",
     "PilotLedger",
     "Reservation",
     "migrate_legacy_ledger",
