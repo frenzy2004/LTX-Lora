@@ -15,6 +15,7 @@ from .artifacts import safe_relative_name, sha256_file
 
 STRUCTURAL_REPORT_SCHEMA = "a2v-structural-report-v1"
 GROUP_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}", re.ASCII)
+NORMALIZED_MP4_MAJOR_BRAND = "isom"
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,7 @@ def _ffprobe(
     show_entries = (
         "stream=codec_name,codec_type,width,height,pix_fmt,avg_frame_rate,"
         "r_frame_rate,nb_read_frames,start_time,duration,sample_rate,"
-        "channels,sample_fmt,time_base:format=format_name"
+        "channels,sample_fmt,time_base:format=format_name:format_tags=major_brand"
     )
     if show_frames:
         show_entries += ":frame=media_type,best_effort_timestamp"
@@ -146,6 +147,14 @@ def _format_names(payload: dict, *, label: str) -> set[str]:
     if type(format_value) is not dict or type(format_value.get("format_name")) is not str:
         raise ValueError(f"{label} has an invalid container format")
     return set(format_value["format_name"].split(","))
+
+
+def _major_brand(payload: dict, *, label: str) -> str:
+    format_value = payload.get("format")
+    tags = format_value.get("tags") if type(format_value) is dict else None
+    if type(tags) is not dict or type(tags.get("major_brand")) is not str:
+        raise ValueError(f"{label} has no identifying major brand")
+    return tags["major_brand"]
 
 
 def _decimal_field(stream: dict, field: str, *, label: str, default: str | None = None) -> Decimal:
@@ -306,7 +315,11 @@ def validate_a2v_directory(
             label=f"group {group_id} audio",
         )
 
-        if "mp4" not in _format_names(target_probe, label=f"group {group_id} target"):
+        if (
+            "mp4" not in _format_names(target_probe, label=f"group {group_id} target")
+            or _major_brand(target_probe, label=f"group {group_id} target")
+            != NORMALIZED_MP4_MAJOR_BRAND
+        ):
             raise ValueError(f"group {group_id} target container must be MP4")
         if "png_pipe" not in _format_names(
             image_probe,

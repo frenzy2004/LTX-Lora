@@ -12,6 +12,11 @@ from ltx_lora_pilot.a2v_quality import (
 from ltx_lora_pilot.artifacts import atomic_write_json
 
 
+class _NeutralArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.exit(2, "A2V_ARGUMENT_ERROR\n")
+
+
 def _same_file(left: Path, right: Path) -> bool:
     try:
         return left.samefile(right)
@@ -38,7 +43,9 @@ def _validate_report_destination(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate an extracted fal LTX A2V dataset before upload")
+    parser = _NeutralArgumentParser(
+        description="Validate an extracted fal LTX A2V dataset before upload"
+    )
     parser.add_argument("--dataset-dir", type=Path, required=True)
     parser.add_argument("--quality-attestation", type=Path, required=True)
     parser.add_argument("--structural-report", type=Path, required=True)
@@ -61,7 +68,7 @@ def main() -> None:
         atomic_write_json(args.structural_report, structural_report)
         output = json.dumps(summary, sort_keys=True)
     except Exception:
-        parser.error("A2V_VALIDATION_FAILED")
+        parser.exit(2, "A2V_VALIDATION_FAILED\n")
     print(output)
 
 

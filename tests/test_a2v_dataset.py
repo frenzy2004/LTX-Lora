@@ -36,12 +36,15 @@ def _make_group(
     target_has_audio: bool = False,
     target_codec: str = "libx264",
     target_format: str | None = None,
+    target_size: str = "64x96",
     audio_codec: str = "pcm_s16le",
     audio_format: str | None = None,
     audio_channels: int = 1,
+    audio_sample_rate: int = 48_000,
     target_start_offset: str = "0",
     first_frame_mismatch: bool = False,
     start_format: str | None = None,
+    start_size: str | None = None,
     frames: int = 9,
     fps: int = 24,
 ) -> None:
@@ -52,7 +55,7 @@ def _make_group(
         "-f",
         "lavfi",
         "-i",
-        f"color=c=blue:s=64x96:r={fps}",
+        f"color=c=blue:s={target_size}:r={fps}",
     ]
     if target_has_audio:
         target_arguments.extend(
@@ -101,15 +104,17 @@ def _make_group(
         )
     else:
         start_arguments = ["-i", str(target), "-frames:v", "1"]
+        if start_size is not None:
+            start_arguments.extend(["-vf", f"scale={start_size.replace('x', ':')}"])
         if start_format is not None:
             start_arguments.extend(["-c:v", "png", "-f", start_format])
         start_arguments.append(str(start))
         _run_ffmpeg(start_arguments)
 
     audio_source = (
-        "anullsrc=r=48000:cl=mono"
+        f"anullsrc=r={audio_sample_rate}:cl=mono"
         if silent
-        else "sine=frequency=440:sample_rate=48000"
+        else f"sine=frequency=440:sample_rate={audio_sample_rate}"
     )
     audio_arguments = [
             "-f",
@@ -204,6 +209,17 @@ def test_a2v_group_rejects_non_mp4_target_container(tmp_path: Path) -> None:
         _validate(tmp_path)
 
 
+@pytest.mark.parametrize("target_format", ["mov", "3gp"])
+def test_a2v_group_rejects_other_isobmff_container_disguised_as_mp4(
+    tmp_path: Path,
+    target_format: str,
+) -> None:
+    _make_group(tmp_path, target_format=target_format)
+
+    with pytest.raises(ValueError, match="target container must be MP4"):
+        _validate(tmp_path)
+
+
 def test_a2v_group_rejects_non_png_start_container(tmp_path: Path) -> None:
     _make_group(tmp_path, start_format="matroska")
 
@@ -229,6 +245,32 @@ def test_a2v_group_rejects_stereo_audio(tmp_path: Path) -> None:
     _make_group(tmp_path, audio_channels=2)
 
     with pytest.raises(ValueError, match="audio must be mono"):
+        _validate(tmp_path)
+
+
+def test_a2v_group_rejects_wrong_audio_sample_rate(tmp_path: Path) -> None:
+    _make_group(tmp_path, audio_sample_rate=44_100)
+
+    with pytest.raises(ValueError, match="audio sample rate is not 48000 Hz"):
+        _validate(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("target_size", "start_size", "message"),
+    [
+        ("32x96", None, "target dimensions do not match 64x96"),
+        ("64x96", "32x96", "start dimensions do not match 64x96"),
+    ],
+)
+def test_a2v_group_rejects_wrong_dimensions(
+    tmp_path: Path,
+    target_size: str,
+    start_size: str | None,
+    message: str,
+) -> None:
+    _make_group(tmp_path, target_size=target_size, start_size=start_size)
+
+    with pytest.raises(ValueError, match=message):
         _validate(tmp_path)
 
 

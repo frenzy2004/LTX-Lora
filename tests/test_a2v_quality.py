@@ -4,6 +4,7 @@ import hashlib
 from importlib.util import module_from_spec, spec_from_file_location
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -351,8 +352,38 @@ def test_validation_cli_requires_attestation_and_structural_report_paths(
         CLI_MODULE.main()
 
     error = capsys.readouterr().err
-    assert "--quality-attestation" in error
-    assert "--structural-report" in error
+    assert error == "A2V_ARGUMENT_ERROR\n"
+
+
+def test_validation_cli_sanitizes_malformed_argument_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_marker = "sensitive-input-marker"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "validate_a2v_dataset.py",
+            "--dataset-dir",
+            str(tmp_path / "dataset"),
+            "--quality-attestation",
+            str(tmp_path / "attestation.json"),
+            "--structural-report",
+            str(tmp_path / "structural.json"),
+            "--unexpected-private-option",
+            private_marker,
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        CLI_MODULE.main()
+
+    captured = capsys.readouterr()
+    assert captured.err == "A2V_ARGUMENT_ERROR\n"
+    assert private_marker not in captured.err
+    assert captured.out == ""
 
 
 def test_validation_cli_writes_structural_report_and_prints_sanitized_summary(
@@ -490,6 +521,131 @@ def test_validation_cli_rejects_structural_report_input_alias(
     assert "A2V_VALIDATION_FAILED" in captured.err
     assert captured.out == ""
     assert structural_path.read_bytes() == original_bytes
+
+
+def test_validation_cli_rejects_resolved_directory_alias_into_dataset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    alias_dir = tmp_path / "dataset-alias"
+    try:
+        alias_dir.symlink_to(dataset_dir, target_is_directory=True)
+    except OSError:
+        if sys.platform != "win32":
+            pytest.skip("directory symlinks are unavailable on this test filesystem")
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(alias_dir), str(dataset_dir)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    attestation_path = tmp_path / "quality-attestation.json"
+    attestation_path.write_text("private attestation sentinel", encoding="utf-8")
+    structural_path = alias_dir / "structural-report.json"
+
+    monkeypatch.setattr(
+        CLI_MODULE,
+        "validate_a2v_directory",
+        lambda *args, **kwargs: make_structural_report(15),
+    )
+    monkeypatch.setattr(
+        CLI_MODULE,
+        "load_quality_attestation",
+        lambda path: make_attestation(),
+    )
+    monkeypatch.setattr(
+        CLI_MODULE,
+        "validate_quality_and_splits",
+        lambda *args: {"status": "valid"},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "validate_a2v_dataset.py",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--quality-attestation",
+            str(attestation_path),
+            "--structural-report",
+            str(structural_path),
+        ],
+    )
+
+    try:
+        with pytest.raises(SystemExit):
+            CLI_MODULE.main()
+
+        captured = capsys.readouterr()
+        assert captured.err == "A2V_VALIDATION_FAILED\n"
+        assert captured.out == ""
+        assert not structural_path.exists()
+    finally:
+        structural_path.unlink(missing_ok=True)
+        if alias_dir.is_symlink():
+            alias_dir.unlink()
+        else:
+            alias_dir.rmdir()
+
+
+def test_validation_cli_rejects_hardlink_alias_to_dataset_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    candidate_path = dataset_dir / "sample_001.txt"
+    candidate_path.write_text("candidate sentinel", encoding="utf-8")
+    attestation_path = tmp_path / "quality-attestation.json"
+    attestation_path.write_text("private attestation sentinel", encoding="utf-8")
+    structural_path = tmp_path / "structural-report.json"
+    structural_path.hardlink_to(candidate_path)
+    original_bytes = candidate_path.read_bytes()
+
+    monkeypatch.setattr(
+        CLI_MODULE,
+        "validate_a2v_directory",
+        lambda *args, **kwargs: make_structural_report(15),
+    )
+    monkeypatch.setattr(
+        CLI_MODULE,
+        "load_quality_attestation",
+        lambda path: make_attestation(),
+    )
+    monkeypatch.setattr(
+        CLI_MODULE,
+        "validate_quality_and_splits",
+        lambda *args: {"status": "valid"},
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "validate_a2v_dataset.py",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--quality-attestation",
+            str(attestation_path),
+            "--structural-report",
+            str(structural_path),
+        ],
+    )
+
+    try:
+        with pytest.raises(SystemExit):
+            CLI_MODULE.main()
+
+        captured = capsys.readouterr()
+        assert captured.err == "A2V_VALIDATION_FAILED\n"
+        assert captured.out == ""
+        assert candidate_path.read_bytes() == original_bytes
+        assert structural_path.read_bytes() == original_bytes
+    finally:
+        structural_path.unlink(missing_ok=True)
 
 
 def test_validation_cli_sanitizes_private_paths_on_failure(
