@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 import hashlib
 import json
 import multiprocessing
@@ -161,6 +161,109 @@ def _reservation_worker(
         results.put(("rejected", type(exc).__name__, str(exc)))
 
 
+def _post_snapshot_commit_worker(
+    ledger_path: str,
+    ready: Any,
+    start: Any,
+    done: Any,
+    results: Any,
+) -> None:
+    try:
+        ledger = PilotLedger.open_existing(
+            Path(ledger_path),
+            PILOT_ID,
+            expected_ledger_id=LEDGER_ID,
+        )
+        ready.set()
+        if not start.wait(20):
+            results.put(("timeout",))
+            return
+        reservation = ledger.reserve(
+            _bundle_id(300),
+            _typed_id("exec", 300),
+            Decimal("0.1000"),
+        )
+        results.put(("reserved", reservation.id))
+    except Exception as exc:
+        results.put(("rejected", type(exc).__name__, str(exc)))
+    finally:
+        done.set()
+
+
+def _migration_worker(
+    source_path: str,
+    manifest_path: str,
+    ledger_path: str,
+    ready: Any,
+    start: Any,
+    results: Any,
+) -> None:
+    ready.put("ready")
+    if not start.wait(20):
+        results.put(("timeout",))
+        return
+    try:
+        ledger = migrate_legacy_ledger(
+            Path(source_path),
+            Path(manifest_path),
+            Path(ledger_path),
+        )
+        results.put(("migrated", ledger.remaining().to_eng_string()))
+    except Exception as exc:
+        results.put(("rejected", type(exc).__name__, str(exc)))
+
+
+def _windows_hold_without_delete_share(
+    temporary_path: str,
+    destination_path: str,
+    ready: Any,
+    release: Any,
+    results: Any,
+) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    invalid_handle = ctypes.c_void_p(-1).value
+    handles = []
+    try:
+        for database_path in (temporary_path, destination_path):
+            handle = create_file(
+                database_path,
+                0x80000000,
+                0x00000001 | 0x00000002,
+                None,
+                3,
+                0x00000080,
+                None,
+            )
+            if handle == invalid_handle:
+                results.put(("error", ctypes.get_last_error()))
+                ready.set()
+                return
+            handles.append(handle)
+        results.put(("opened",))
+        ready.set()
+        release.wait(30)
+    finally:
+        for handle in handles:
+            close_handle(handle)
+
+
 def test_migration_reproduces_exact_conservative_total(tmp_path: Path) -> None:
     ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
 
@@ -191,6 +294,13 @@ def test_open_existing_never_creates_or_mutates_a_database(tmp_path: Path) -> No
     with pytest.raises(ValueError, match="migration manifest is required"):
         PilotLedger.open_existing(fresh, PILOT_ID, expected_ledger_id=LEDGER_ID)
     assert fresh.read_bytes() == before
+
+
+def test_open_existing_requires_expected_ledger_identity(tmp_path: Path) -> None:
+    _, _, _, ledger_path = _migrate_fixture(tmp_path)
+
+    with pytest.raises(TypeError, match="expected_ledger_id"):
+        PilotLedger.open_existing(ledger_path, PILOT_ID)  # type: ignore[call-arg]
 
 
 def test_migration_rejects_source_ledger_hash_mismatch_atomically(tmp_path: Path) -> None:
@@ -332,6 +442,144 @@ def test_migration_is_one_shot_and_does_not_replace_existing_destination(
     assert ledger.verify_integrity() is True
 
 
+def test_two_processes_have_exactly_one_migration_activation_winner(
+    tmp_path: Path,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_migration_worker,
+            args=(
+                str(source_path),
+                str(manifest_path),
+                str(ledger_path),
+                ready,
+                start,
+                results,
+            ),
+        )
+        for _ in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        assert [ready.get(timeout=30) for _ in processes] == ["ready", "ready"]
+        start.set()
+        observed = [results.get(timeout=30) for _ in processes]
+        for process in processes:
+            process.join(timeout=30)
+            assert not process.is_alive()
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+            process.close()
+        ready.close()
+        ready.join_thread()
+        results.close()
+        results.join_thread()
+
+    assert [item[0] for item in observed].count("migrated") == 1
+    assert [item[0] for item in observed].count("rejected") == 1
+    assert next(item for item in observed if item[0] == "migrated") == (
+        "migrated",
+        "8.4591",
+    )
+    rejected = next(item for item in observed if item[0] == "rejected")
+    assert rejected[1] == "ValueError"
+    reopened = PilotLedger.open_existing(
+        ledger_path,
+        PILOT_ID,
+        expected_ledger_id=LEDGER_ID,
+    )
+    assert reopened.verify_integrity() is True
+    assert not list(tmp_path.glob(".pilot.sqlite3.*.tmp"))
+
+
+@pytest.mark.parametrize("suffix", ["-wal", "-shm"])
+def test_migration_rejects_orphan_destination_sidecars_before_publication(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    sidecar = Path(f"{ledger_path}{suffix}")
+    sidecar.write_bytes(b"synthetic orphan SQLite sidecar")
+    before = sidecar.read_bytes()
+
+    with pytest.raises(ValueError, match="destination ledger sidecar exists"):
+        migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert not ledger_path.exists()
+    assert sidecar.read_bytes() == before
+
+
+def test_migration_fails_closed_when_destination_sidecar_cannot_be_stat_checked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    denied_sidecar = Path(f"{ledger_path}-wal")
+    original_lstat = Path.lstat
+
+    def deny_sidecar_stat(path: Path) -> os.stat_result:
+        if path == denied_sidecar:
+            raise PermissionError("synthetic sidecar metadata denial")
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", deny_sidecar_stat)
+
+    with pytest.raises(ValueError, match="destination ledger path cannot be verified"):
+        migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert not ledger_path.exists()
+
+
+def test_migration_rejects_orphan_hot_journal_before_publication(
+    tmp_path: Path,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    crash_script = """
+import os
+import sqlite3
+import sys
+
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("PRAGMA journal_mode = DELETE")
+connection.execute("PRAGMA synchronous = FULL")
+connection.execute("CREATE TABLE old_ledger (value TEXT NOT NULL)")
+connection.execute("INSERT INTO old_ledger VALUES ('before')")
+connection.commit()
+connection.execute("BEGIN IMMEDIATE")
+connection.execute("UPDATE old_ledger SET value = 'after'")
+os._exit(0)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", crash_script, str(ledger_path)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    journal_path = Path(f"{ledger_path}-journal")
+    assert journal_path.exists()
+    journal_bytes = journal_path.read_bytes()
+    assert journal_bytes
+    ledger_path.unlink()
+
+    with pytest.raises(ValueError, match="destination ledger sidecar exists"):
+        migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert not ledger_path.exists()
+    assert journal_path.read_bytes() == journal_bytes
+
+
 def test_migration_does_not_publish_a_candidate_that_fails_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -357,6 +605,380 @@ def test_migration_does_not_publish_a_candidate_that_fails_verification(
     assert not ledger_path.exists()
 
 
+def test_migration_requires_candidate_digest_stability_during_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    original_verify_connection = pilot_ledger._verify_connection
+    mutated = False
+
+    def verify_then_mutate_header(
+        connection: sqlite3.Connection,
+        *,
+        expected_pilot_id: str,
+        expected_ledger_id: str,
+        staged: bool = False,
+    ) -> Any:
+        nonlocal mutated
+        snapshot = original_verify_connection(
+            connection,
+            expected_pilot_id=expected_pilot_id,
+            expected_ledger_id=expected_ledger_id,
+            staged=staged,
+        )
+        if staged and not mutated:
+            database_path = Path(
+                connection.execute("PRAGMA database_list").fetchone()[2]
+            )
+            with database_path.open("r+b") as database_file:
+                database_file.seek(68)
+                database_file.write((1280591951).to_bytes(4, "big"))
+                database_file.flush()
+                os.fsync(database_file.fileno())
+            mutated = True
+        return snapshot
+
+    monkeypatch.setattr(
+        pilot_ledger,
+        "_verify_connection",
+        verify_then_mutate_header,
+    )
+
+    with pytest.raises(ValueError, match="ledger publication verification failed"):
+        migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert mutated is True
+    assert not ledger_path.exists()
+
+
+def test_migration_rejects_candidate_mutated_by_the_link_publication_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    original_link = os.link
+    original_unlink = Path.unlink
+
+    def mutate_then_link(source: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        original_link(source, destination, *args, **kwargs)
+        with closing(sqlite3.connect(destination)) as connection, connection:
+            connection.execute("PRAGMA application_id = 1280591949")
+
+    def refuse_destination_cleanup(
+        path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if path == ledger_path:
+            raise PermissionError("synthetic destination cleanup lock")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(pilot_ledger.os, "link", mutate_then_link)
+    monkeypatch.setattr(Path, "unlink", refuse_destination_cleanup)
+
+    with pytest.raises(ValueError, match="ledger publication"):
+        migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert ledger_path.exists()
+    assert ledger_path.stat().st_nlink == 1
+    with pytest.raises(ValueError):
+        PilotLedger.open_existing(
+            ledger_path,
+            PILOT_ID,
+            expected_ledger_id=LEDGER_ID,
+        )
+
+
+def test_migration_rejects_sidecar_created_by_the_link_publication_hook(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    sidecar = Path(f"{ledger_path}-wal")
+    sidecar_bytes = b"synthetic sidecar race must be preserved"
+    original_link = os.link
+    original_unlink = Path.unlink
+
+    def link_then_create_sidecar(
+        source: Any,
+        destination: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        original_link(source, destination, *args, **kwargs)
+        sidecar.write_bytes(sidecar_bytes)
+
+    def refuse_destination_cleanup(
+        path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if path == ledger_path:
+            raise PermissionError("synthetic destination cleanup lock")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(pilot_ledger.os, "link", link_then_create_sidecar)
+    monkeypatch.setattr(Path, "unlink", refuse_destination_cleanup)
+
+    with pytest.raises(ValueError, match="ledger publication failed safely"):
+        migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert ledger_path.exists()
+    assert ledger_path.stat().st_nlink == 1
+    assert sidecar.read_bytes() == sidecar_bytes
+    sidecar.unlink()
+    with pytest.raises(ValueError):
+        PilotLedger.open_existing(
+            ledger_path,
+            PILOT_ID,
+            expected_ledger_id=LEDGER_ID,
+        )
+
+
+def test_activation_rehashes_staged_bytes_after_acquiring_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    original_begin_immediate = pilot_ledger._begin_immediate
+    original_unlink = Path.unlink
+    mutated = False
+
+    def mutate_then_begin(connection: sqlite3.Connection) -> None:
+        nonlocal mutated
+        if not mutated:
+            with closing(sqlite3.connect(ledger_path)) as mutator, mutator:
+                mutator.execute("PRAGMA application_id = 1280591950")
+            mutated = True
+        original_begin_immediate(connection)
+
+    def refuse_destination_cleanup(
+        path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if path == ledger_path:
+            raise PermissionError("synthetic destination cleanup lock")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(pilot_ledger, "_begin_immediate", mutate_then_begin)
+    monkeypatch.setattr(Path, "unlink", refuse_destination_cleanup)
+
+    with pytest.raises(ValueError, match="ledger publication failed safely"):
+        migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert mutated is True
+    assert ledger_path.exists()
+    assert ledger_path.stat().st_nlink == 1
+    with pytest.raises(ValueError):
+        PilotLedger.open_existing(
+            ledger_path,
+            PILOT_ID,
+            expected_ledger_id=LEDGER_ID,
+        )
+
+
+def test_activation_rechecks_sidecars_after_acquiring_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    sidecar = Path(f"{ledger_path}-wal")
+    sidecar_bytes = b"synthetic activation sidecar race"
+    original_begin_immediate = pilot_ledger._begin_immediate
+    original_unlink = Path.unlink
+
+    def begin_then_create_sidecar(connection: sqlite3.Connection) -> None:
+        original_begin_immediate(connection)
+        sidecar.write_bytes(sidecar_bytes)
+
+    def refuse_destination_cleanup(
+        path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if path == ledger_path:
+            raise PermissionError("synthetic destination cleanup lock")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(pilot_ledger, "_begin_immediate", begin_then_create_sidecar)
+    monkeypatch.setattr(Path, "unlink", refuse_destination_cleanup)
+
+    with pytest.raises(ValueError, match="ledger publication failed safely"):
+        migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert ledger_path.exists()
+    assert sidecar.read_bytes() == sidecar_bytes
+    sidecar.unlink()
+    with pytest.raises(ValueError):
+        PilotLedger.open_existing(
+            ledger_path,
+            PILOT_ID,
+            expected_ledger_id=LEDGER_ID,
+        )
+
+
+def test_activation_commit_acknowledgement_loss_returns_verified_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    original_connect = sqlite3.connect
+
+    class CommitThenRaiseConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+        def commit(self) -> None:
+            self._connection.commit()
+            raise sqlite3.OperationalError("synthetic lost commit acknowledgement")
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        connection = original_connect(*args, **kwargs)
+        target = args[0] if args else kwargs.get("database")
+        if isinstance(target, str) and target.endswith("?mode=rw"):
+            return CommitThenRaiseConnection(connection)
+        return connection
+
+    monkeypatch.setattr(pilot_ledger.sqlite3, "connect", connect)
+
+    ledger = migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert ledger.verify_integrity() is True
+    assert ledger.remaining() == Decimal("8.4591")
+
+
+def test_activation_commit_failure_before_effect_rolls_back_to_staged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    original_connect = sqlite3.connect
+    original_unlink = Path.unlink
+
+    class CommitBeforeEffectFailureConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+        def commit(self) -> None:
+            raise sqlite3.OperationalError("synthetic commit failure before effect")
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        connection = original_connect(*args, **kwargs)
+        target = args[0] if args else kwargs.get("database")
+        if isinstance(target, str) and target.endswith("?mode=rw"):
+            return CommitBeforeEffectFailureConnection(connection)
+        return connection
+
+    def refuse_destination_cleanup(
+        path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        if path == ledger_path:
+            raise PermissionError("synthetic destination cleanup lock")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(pilot_ledger.sqlite3, "connect", connect)
+    monkeypatch.setattr(Path, "unlink", refuse_destination_cleanup)
+
+    with pytest.raises(ValueError, match="ledger publication failed safely"):
+        migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (0,)
+        assert connection.execute(
+            "SELECT schema_version FROM pilot WHERE singleton = 1"
+        ).fetchone() == (pilot_ledger.STAGED_LEDGER_SCHEMA_VERSION,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchone() == (0,)
+    with pytest.raises(ValueError):
+        PilotLedger.open_existing(
+            ledger_path,
+            PILOT_ID,
+            expected_ledger_id=LEDGER_ID,
+        )
+
+
+def test_activation_reopens_to_classify_commit_after_connection_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    original_connect = sqlite3.connect
+
+    class CommitThenDisconnectConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        @property
+        def in_transaction(self) -> bool:
+            return False
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+        def commit(self) -> None:
+            self._connection.commit()
+            self._connection.close()
+            raise sqlite3.OperationalError("synthetic connection loss after commit")
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        connection = original_connect(*args, **kwargs)
+        target = args[0] if args else kwargs.get("database")
+        if isinstance(target, str) and target.endswith("?mode=rw"):
+            return CommitThenDisconnectConnection(connection)
+        return connection
+
+    monkeypatch.setattr(pilot_ledger.sqlite3, "connect", connect)
+
+    ledger = migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert ledger.verify_integrity() is True
+    assert ledger.remaining() == Decimal("8.4591")
+
+
+def test_activation_close_failure_after_commit_cannot_reverse_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    original_connect = sqlite3.connect
+
+    class CloseThenRaiseConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+        def close(self) -> None:
+            self._connection.close()
+            raise OSError("synthetic close acknowledgement loss")
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        connection = original_connect(*args, **kwargs)
+        target = args[0] if args else kwargs.get("database")
+        if isinstance(target, str) and target.endswith("?mode=rw"):
+            return CloseThenRaiseConnection(connection)
+        return connection
+
+    monkeypatch.setattr(pilot_ledger.sqlite3, "connect", connect)
+
+    ledger = migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert ledger.verify_integrity() is True
+    assert ledger.remaining() == Decimal("8.4591")
+
+
 def test_migration_never_reports_failure_with_a_usable_published_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -364,15 +986,9 @@ def test_migration_never_reports_failure_with_a_usable_published_ledger(
     source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
     original_unlink = Path.unlink
 
-    def fail_verification(
-        cls: type[PilotLedger],
-        path: Path,
-        expected_pilot_id: str,
-        *,
-        expected_ledger_id: str | None = None,
-    ) -> PilotLedger:
-        del cls, path, expected_pilot_id, expected_ledger_id
-        raise ValueError("synthetic verification failure")
+    def fail_activation(connection: sqlite3.Connection) -> None:
+        connection.execute(pilot_ledger.TRIGGER_STATEMENTS[0])
+        raise ValueError("synthetic activation failure")
 
     def refuse_destination_cleanup(
         path: Path,
@@ -383,12 +999,31 @@ def test_migration_never_reports_failure_with_a_usable_published_ledger(
             raise PermissionError("synthetic destination lock")
         original_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(PilotLedger, "open_existing", classmethod(fail_verification))
+    monkeypatch.setattr(
+        pilot_ledger,
+        "_create_immutability_triggers",
+        fail_activation,
+    )
     monkeypatch.setattr(Path, "unlink", refuse_destination_cleanup)
 
-    with pytest.raises(ValueError, match="ledger publication verification failed"):
+    with pytest.raises(ValueError, match="ledger publication failed safely"):
         migrate_legacy_ledger(source_path, manifest_path, ledger_path)
-    assert not ledger_path.exists()
+    assert ledger_path.exists()
+    assert ledger_path.stat().st_nlink == 1
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (0,)
+        assert connection.execute(
+            "SELECT schema_version FROM pilot WHERE singleton = 1"
+        ).fetchone() == (pilot_ledger.STAGED_LEDGER_SCHEMA_VERSION,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchone() == (0,)
+    with pytest.raises(ValueError):
+        PilotLedger.open_existing(
+            ledger_path,
+            PILOT_ID,
+            expected_ledger_id=LEDGER_ID,
+        )
 
 
 def test_failed_publication_uses_hardlink_quarantine_when_cleanup_is_locked(
@@ -423,6 +1058,77 @@ def test_failed_publication_uses_hardlink_quarantine_when_cleanup_is_locked(
     assert os.path.samefile(ledger_path, quarantine_links[0])
     assert ledger_path.stat().st_nlink >= 2
     with pytest.raises(ValueError, match="canonical ledger path"):
+        PilotLedger.open_existing(
+            ledger_path,
+            PILOT_ID,
+            expected_ledger_id=LEDGER_ID,
+        )
+
+    original_unlink(quarantine_links[0])
+    assert ledger_path.stat().st_nlink == 1
+    with pytest.raises(ValueError):
+        PilotLedger.open_existing(
+            ledger_path,
+            PILOT_ID,
+            expected_ledger_id=LEDGER_ID,
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows share-mode semantics")
+def test_windows_delete_share_lock_cannot_make_failed_destination_later_usable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    results = context.Queue()
+    original_link = os.link
+    lock_process: Any = None
+    quarantine_links: list[Path] = []
+
+    def link_then_lock_temporary(
+        source: Any,
+        destination: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        nonlocal lock_process
+        original_link(source, destination, *args, **kwargs)
+        lock_process = context.Process(
+            target=_windows_hold_without_delete_share,
+            args=(str(source), str(destination), ready, release, results),
+        )
+        lock_process.start()
+        assert ready.wait(30), "delete-share lock process did not become ready"
+        assert results.get(timeout=30) == ("opened",)
+
+    monkeypatch.setattr(pilot_ledger.os, "link", link_then_lock_temporary)
+
+    try:
+        with pytest.raises(ValueError, match="ledger publication failed safely"):
+            migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+        quarantine_links = list(tmp_path.glob(".pilot.sqlite3.*.tmp"))
+        assert ledger_path.exists()
+        assert len(quarantine_links) == 1
+        assert os.path.samefile(ledger_path, quarantine_links[0])
+        assert ledger_path.stat().st_nlink == 2
+    finally:
+        release.set()
+        if lock_process is not None:
+            lock_process.join(timeout=30)
+            if lock_process.is_alive():
+                lock_process.terminate()
+                lock_process.join(timeout=10)
+            lock_process.close()
+        results.close()
+        results.join_thread()
+
+    quarantine_links[0].unlink()
+    assert ledger_path.stat().st_nlink == 1
+    with pytest.raises(ValueError):
         PilotLedger.open_existing(
             ledger_path,
             PILOT_ID,
@@ -525,6 +1231,19 @@ def test_integrity_rejects_schema_or_migration_entry_changes(tmp_path: Path) -> 
         connection.execute("PRAGMA user_version = 2")
 
     with pytest.raises(ValueError, match="schema version mismatch"):
+        ledger.verify_integrity()
+
+
+def test_integrity_rejects_unknown_view_with_private_literal(tmp_path: Path) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    private_literal = "PRIVATE_SCHEMA_LITERAL_MUST_BE_REJECTED"
+    with closing(sqlite3.connect(ledger_path)) as connection, connection:
+        connection.execute(
+            f"CREATE VIEW leaked_private_value AS SELECT '{private_literal}' AS value"
+        )
+
+    assert private_literal.encode("ascii") in ledger_path.read_bytes()
+    with pytest.raises(ValueError, match="ledger schema mismatch"):
         ledger.verify_integrity()
 
 
@@ -1061,3 +1780,59 @@ def test_open_verifies_all_rows_inside_one_read_transaction(
     )
     assert begin_index < integrity_index < event_read_index
     assert normalized[-1] == "ROLLBACK"
+
+
+def test_snapshot_allows_legitimate_process_commit_after_read_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    start = context.Event()
+    done = context.Event()
+    results = context.Queue()
+    process = context.Process(
+        target=_post_snapshot_commit_worker,
+        args=(str(ledger_path), ready, start, done, results),
+    )
+    original_read_connection = pilot_ledger._read_connection
+    triggered = False
+
+    @contextmanager
+    def commit_after_read_transaction(path: Path) -> Any:
+        nonlocal triggered
+        with original_read_connection(path) as connection:
+            yield connection
+        if not triggered:
+            triggered = True
+            start.set()
+            assert done.wait(30), "writer did not commit after the read transaction"
+
+    try:
+        process.start()
+        assert ready.wait(30), "writer did not open the ledger"
+        monkeypatch.setattr(
+            pilot_ledger,
+            "_read_connection",
+            commit_after_read_transaction,
+        )
+
+        assert ledger.remaining() == Decimal("8.4591")
+        assert results.get(timeout=30)[0] == "reserved"
+        process.join(timeout=30)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+        reopened = PilotLedger.open_existing(
+            ledger_path,
+            PILOT_ID,
+            expected_ledger_id=LEDGER_ID,
+        )
+        assert reopened.remaining() == Decimal("8.3591")
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+        process.close()
+        results.close()
+        results.join_thread()

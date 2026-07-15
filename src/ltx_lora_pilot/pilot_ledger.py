@@ -19,15 +19,18 @@ from .budget import money
 
 
 LEDGER_SCHEMA_VERSION = "pilot-budget-ledger-v1"
+STAGED_LEDGER_SCHEMA_VERSION = "pilot-budget-ledger-v1-staged"
 MIGRATION_SCHEMA_VERSION = "pilot-budget-migration-v1"
 EVENT_SCHEMA_VERSION = "pilot-budget-event-v1"
 SQLITE_USER_VERSION = 1
+STAGED_SQLITE_USER_VERSION = 0
 BUSY_TIMEOUT_MILLISECONDS = 5_000
 CAP_USD_TEXT = "12.0000"
 CAP_USD = Decimal(CAP_USD_TEXT)
 LEGACY_ENTRY_COUNT = 6
 LEGACY_COMMITTED_USD = Decimal("3.5409")
 GENESIS_HASH = "0" * 64
+SQLITE_SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
 
 COMMITTED_STATES = frozenset(
     {"reserved", "uploading", "submit_started", "submitted", "consumed"}
@@ -235,15 +238,71 @@ TRIGGER_STATEMENTS = (
     """,
 )
 
+TABLE_NAMES = ("pilot", "reservations", "migration_entries", "events")
+INDEX_OBJECTS = (
+    ("reservations_bundle_execution_unique", "reservations"),
+    ("reservations_bundle_unique", "reservations"),
+    ("reservations_execution_unique", "reservations"),
+    ("events_reservation_index", "events"),
+)
+TRIGGER_OBJECTS = (
+    ("pilot_no_insert", "pilot"),
+    ("pilot_no_update", "pilot"),
+    ("pilot_no_delete", "pilot"),
+    ("migration_entries_no_insert", "migration_entries"),
+    ("migration_entries_no_update", "migration_entries"),
+    ("migration_entries_no_delete", "migration_entries"),
+    ("reservations_no_update", "reservations"),
+    ("reservations_no_delete", "reservations"),
+    ("events_no_update", "events"),
+    ("events_no_delete", "events"),
+)
+IMPLICIT_INDEX_OBJECTS = (
+    ("sqlite_autoindex_pilot_1", "pilot"),
+    ("sqlite_autoindex_pilot_2", "pilot"),
+    ("sqlite_autoindex_pilot_3", "pilot"),
+    ("sqlite_autoindex_reservations_1", "reservations"),
+    ("sqlite_autoindex_migration_entries_1", "migration_entries"),
+    ("sqlite_autoindex_migration_entries_2", "migration_entries"),
+    ("sqlite_autoindex_events_1", "events"),
+    ("sqlite_autoindex_events_2", "events"),
+)
+
 
 def _normalize_sql(value: str) -> str:
     return " ".join(value.split()).strip().removesuffix(";")
 
 
-EXPECTED_SCHEMA_SQL = frozenset(
-    _normalize_sql(statement)
-    for statement in (*TABLE_STATEMENTS, *INDEX_STATEMENTS, *TRIGGER_STATEMENTS)
-)
+def _expected_schema_objects(*, staged: bool) -> frozenset[tuple[str, str, str, str | None]]:
+    objects: set[tuple[str, str, str, str | None]] = {
+        ("table", name, name, _normalize_sql(statement))
+        for name, statement in zip(TABLE_NAMES, TABLE_STATEMENTS, strict=True)
+    }
+    objects.update(
+        ("index", name, table, _normalize_sql(statement))
+        for (name, table), statement in zip(
+            INDEX_OBJECTS,
+            INDEX_STATEMENTS,
+            strict=True,
+        )
+    )
+    objects.update(
+        ("index", name, table, None) for name, table in IMPLICIT_INDEX_OBJECTS
+    )
+    if not staged:
+        objects.update(
+            ("trigger", name, table, _normalize_sql(statement))
+            for (name, table), statement in zip(
+                TRIGGER_OBJECTS,
+                TRIGGER_STATEMENTS,
+                strict=True,
+            )
+        )
+    return frozenset(objects)
+
+
+EXPECTED_STAGED_SCHEMA_OBJECTS = _expected_schema_objects(staged=True)
+EXPECTED_SCHEMA_OBJECTS = _expected_schema_objects(staged=False)
 
 
 def _exact_object(value: Any, fields: frozenset[str], *, label: str) -> dict[str, Any]:
@@ -397,10 +456,33 @@ def _canonical_existing_file(path: Path, *, label: str) -> Path:
     return resolved
 
 
+def _path_entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ValueError("destination ledger path cannot be verified") from exc
+    return True
+
+
+def _reject_destination_sidecars(destination: Path) -> None:
+    if any(
+        _path_entry_exists(Path(f"{destination}{suffix}"))
+        for suffix in SQLITE_SIDECAR_SUFFIXES
+    ):
+        raise ValueError("destination ledger sidecar exists")
+
+
+def _preflight_destination_entries(destination: Path) -> None:
+    if _path_entry_exists(destination):
+        raise ValueError("destination ledger already exists")
+    _reject_destination_sidecars(destination)
+
+
 def _canonical_destination(path: Path) -> Path:
     candidate = Path(path)
-    if candidate.exists():
-        raise ValueError("destination ledger already exists")
+    _preflight_destination_entries(candidate)
     parent = candidate.parent
     if not parent.exists() or not parent.is_dir() or _has_alias_component(parent):
         raise ValueError("canonical destination directory is required")
@@ -408,7 +490,51 @@ def _canonical_destination(path: Path) -> Path:
     absolute_parent = Path(os.path.abspath(parent))
     if os.path.normcase(str(resolved_parent)) != os.path.normcase(str(absolute_parent)):
         raise ValueError("canonical destination directory is required")
-    return resolved_parent / candidate.name
+    destination = resolved_parent / candidate.name
+    _preflight_destination_entries(destination)
+    return destination
+
+
+def _object_identity(stat_result: os.stat_result) -> tuple[int, int]:
+    return stat_result.st_dev, stat_result.st_ino
+
+
+def _ensure_path_identity(
+    path: Path,
+    anchor: os.stat_result,
+    *,
+    expected_links: int,
+) -> None:
+    try:
+        current = path.stat()
+    except OSError as exc:
+        raise ValueError("ledger changed during verification") from exc
+    if (
+        _object_identity(current) != _object_identity(anchor)
+        or current.st_nlink != expected_links
+    ):
+        raise ValueError("ledger changed during verification")
+
+
+@contextmanager
+def _identity_anchor(path: Path) -> Iterator[os.stat_result]:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+        anchor = os.fstat(descriptor)
+        _ensure_path_identity(path, anchor, expected_links=1)
+        yield anchor
+    except OSError as exc:
+        raise ValueError("ledger changed during verification") from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _load_manifest(path: Path) -> tuple[dict[str, Any], str]:
@@ -620,7 +746,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
     for statement in INDEX_STATEMENTS:
         connection.execute(statement)
-    connection.execute(f"PRAGMA user_version = {SQLITE_USER_VERSION}")
+    connection.execute(f"PRAGMA user_version = {STAGED_SQLITE_USER_VERSION}")
 
 
 def _create_immutability_triggers(connection: sqlite3.Connection) -> None:
@@ -654,7 +780,7 @@ def _initialize_database(
             ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                LEDGER_SCHEMA_VERSION,
+                STAGED_LEDGER_SCHEMA_VERSION,
                 manifest["pilot_id"],
                 manifest["ledger_id"],
                 manifest["cap_usd"],
@@ -740,7 +866,6 @@ def _initialize_database(
                 ),
             )
             previous_hash = digest
-        _create_immutability_triggers(connection)
         connection.commit()
         integrity = connection.execute("PRAGMA integrity_check").fetchall()
         if integrity != [("ok",)]:
@@ -794,21 +919,39 @@ def _verify_sqlite_integrity(connection: sqlite3.Connection) -> None:
         raise ValueError("SQLite integrity check failed") from exc
 
 
-def _verify_schema(connection: sqlite3.Connection) -> None:
+def _verify_schema(
+    connection: sqlite3.Connection,
+    *,
+    staged: bool,
+) -> None:
     try:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version != SQLITE_USER_VERSION:
+        expected_version = (
+            STAGED_SQLITE_USER_VERSION if staged else SQLITE_USER_VERSION
+        )
+        if version != expected_version:
             raise ValueError("schema version mismatch")
         rows = connection.execute(
             """
-            SELECT sql FROM sqlite_master
-            WHERE sql IS NOT NULL AND type IN ('table', 'index', 'trigger')
+            SELECT type, name, tbl_name, sql
+            FROM sqlite_master
             """
         ).fetchall()
     except sqlite3.DatabaseError as exc:
         raise ValueError("SQLite integrity check failed") from exc
-    actual = frozenset(_normalize_sql(row[0]) for row in rows)
-    if actual != EXPECTED_SCHEMA_SQL:
+    actual = frozenset(
+        (
+            row[0],
+            row[1],
+            row[2],
+            None if row[3] is None else _normalize_sql(row[3]),
+        )
+        for row in rows
+    )
+    expected = (
+        EXPECTED_STAGED_SCHEMA_OBJECTS if staged else EXPECTED_SCHEMA_OBJECTS
+    )
+    if actual != expected:
         raise ValueError("ledger schema mismatch")
 
 
@@ -842,7 +985,8 @@ def _verify_connection(
     connection: sqlite3.Connection,
     *,
     expected_pilot_id: str,
-    expected_ledger_id: str | None,
+    expected_ledger_id: str,
+    staged: bool = False,
 ) -> _IntegritySnapshot:
     _verify_sqlite_integrity(connection)
     pilot = _read_pilot(connection)
@@ -850,13 +994,17 @@ def _verify_connection(
         version = connection.execute("PRAGMA user_version").fetchone()[0]
     except sqlite3.DatabaseError as exc:
         raise ValueError("SQLite integrity check failed") from exc
-    if version != SQLITE_USER_VERSION:
+    expected_version = STAGED_SQLITE_USER_VERSION if staged else SQLITE_USER_VERSION
+    if version != expected_version:
         raise ValueError("schema version mismatch")
-    if pilot[0] != LEDGER_SCHEMA_VERSION:
+    expected_schema_version = (
+        STAGED_LEDGER_SCHEMA_VERSION if staged else LEDGER_SCHEMA_VERSION
+    )
+    if pilot[0] != expected_schema_version:
         raise ValueError("schema version mismatch")
     if pilot[1] != expected_pilot_id:
         raise ValueError("pilot identity mismatch")
-    if expected_ledger_id is not None and pilot[2] != expected_ledger_id:
+    if pilot[2] != expected_ledger_id:
         raise ValueError("ledger identity mismatch")
     _typed_id(pilot[1], PILOT_ID_PATTERN, label="pilot_id")
     _typed_id(pilot[2], LEDGER_ID_PATTERN, label="ledger_id")
@@ -1046,7 +1194,7 @@ def _verify_connection(
     )
     if committed < 0 or committed > CAP_USD:
         raise ValueError("derived ledger balance is invalid")
-    _verify_schema(connection)
+    _verify_schema(connection, staged=staged)
     return _IntegritySnapshot(
         committed=committed,
         states=states,
@@ -1102,13 +1250,13 @@ class PilotLedger:
         self,
         path: Path,
         expected_pilot_id: str,
-        expected_ledger_id: str | None = None,
+        expected_ledger_id: str,
     ) -> None:
         self.path = path
         self._expected_pilot_id = expected_pilot_id
         self._expected_ledger_id = expected_ledger_id
         self.pilot_id = expected_pilot_id
-        self.ledger_id = expected_ledger_id or ""
+        self.ledger_id = expected_ledger_id
 
     @classmethod
     def open_existing(
@@ -1116,54 +1264,37 @@ class PilotLedger:
         path: Path,
         expected_pilot_id: str,
         *,
-        expected_ledger_id: str | None = None,
+        expected_ledger_id: str,
     ) -> PilotLedger:
         _typed_id(expected_pilot_id, PILOT_ID_PATTERN, label="expected pilot_id")
-        if expected_ledger_id is not None:
-            _typed_id(
-                expected_ledger_id,
-                LEDGER_ID_PATTERN,
-                label="expected ledger_id",
-            )
+        _typed_id(
+            expected_ledger_id,
+            LEDGER_ID_PATTERN,
+            label="expected ledger_id",
+        )
         canonical = _canonical_existing_file(Path(path), label="ledger database")
         ledger = cls(canonical, expected_pilot_id, expected_ledger_id)
-        with _read_connection(canonical) as connection:
-            snapshot = _verify_connection(
-                connection,
-                expected_pilot_id=expected_pilot_id,
-                expected_ledger_id=expected_ledger_id,
-            )
-            pilot = _read_pilot(connection)
+        with _identity_anchor(canonical) as anchor:
+            with _read_connection(canonical) as connection:
+                snapshot = _verify_connection(
+                    connection,
+                    expected_pilot_id=expected_pilot_id,
+                    expected_ledger_id=expected_ledger_id,
+                )
+                _ensure_path_identity(canonical, anchor, expected_links=1)
         del snapshot
-        ledger.ledger_id = pilot[2]
         return ledger
 
     def _snapshot(self) -> _IntegritySnapshot:
         canonical = _canonical_existing_file(self.path, label="ledger database")
-        before = canonical.stat()
-        with _read_connection(canonical) as connection:
-            snapshot = _verify_connection(
-                connection,
-                expected_pilot_id=self._expected_pilot_id,
-                expected_ledger_id=self._expected_ledger_id,
-            )
-        after = canonical.stat()
-        before_identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_nlink,
-        )
-        after_identity = (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_nlink,
-        )
-        if before_identity != after_identity:
-            raise ValueError("ledger changed during verification")
+        with _identity_anchor(canonical) as anchor:
+            with _read_connection(canonical) as connection:
+                snapshot = _verify_connection(
+                    connection,
+                    expected_pilot_id=self._expected_pilot_id,
+                    expected_ledger_id=self._expected_ledger_id,
+                )
+                _ensure_path_identity(canonical, anchor, expected_links=1)
         return snapshot
 
     def verify_integrity(self) -> bool:
@@ -1408,6 +1539,195 @@ class PilotLedger:
                 raise
 
 
+def _verify_staged_candidate(
+    path: Path,
+    *,
+    expected_pilot_id: str,
+    expected_ledger_id: str,
+) -> tuple[str, os.stat_result]:
+    canonical = _canonical_existing_file(path, label="staged ledger database")
+    with _identity_anchor(canonical) as anchor:
+        digest = sha256_file(canonical).sha256
+        _ensure_path_identity(canonical, anchor, expected_links=1)
+        with _read_connection(canonical) as connection:
+            _verify_connection(
+                connection,
+                expected_pilot_id=expected_pilot_id,
+                expected_ledger_id=expected_ledger_id,
+                staged=True,
+            )
+            _ensure_path_identity(canonical, anchor, expected_links=1)
+        if sha256_file(canonical).sha256 != digest:
+            raise ValueError("staged ledger digest mismatch")
+        _ensure_path_identity(canonical, anchor, expected_links=1)
+    return digest, anchor
+
+
+def _verify_linked_staged_destination(
+    destination: Path,
+    *,
+    candidate_anchor: os.stat_result,
+    candidate_digest: str,
+    expected_pilot_id: str,
+    expected_ledger_id: str,
+) -> None:
+    _reject_destination_sidecars(destination)
+    _ensure_path_identity(destination, candidate_anchor, expected_links=2)
+    if sha256_file(destination).sha256 != candidate_digest:
+        raise ValueError("staged ledger digest mismatch")
+    with _read_connection(destination) as connection:
+        _verify_connection(
+            connection,
+            expected_pilot_id=expected_pilot_id,
+            expected_ledger_id=expected_ledger_id,
+            staged=True,
+        )
+        _ensure_path_identity(destination, candidate_anchor, expected_links=2)
+    if sha256_file(destination).sha256 != candidate_digest:
+        raise ValueError("staged ledger digest mismatch")
+
+
+def _commit_error_left_verified_final_ledger(
+    connection: sqlite3.Connection,
+    canonical: Path,
+    anchor: os.stat_result,
+    *,
+    expected_pilot_id: str,
+    expected_ledger_id: str,
+) -> bool:
+    try:
+        transaction_is_active = connection.in_transaction
+    except Exception:
+        transaction_is_active = False
+    if transaction_is_active:
+        return False
+    verified_on_connection = False
+    try:
+        connection.execute("BEGIN")
+        _verify_connection(
+            connection,
+            expected_pilot_id=expected_pilot_id,
+            expected_ledger_id=expected_ledger_id,
+        )
+        _ensure_path_identity(canonical, anchor, expected_links=1)
+        verified_on_connection = True
+    except Exception:
+        pass
+    finally:
+        try:
+            read_transaction_is_active = connection.in_transaction
+        except Exception:
+            read_transaction_is_active = False
+        if read_transaction_is_active:
+            try:
+                connection.rollback()
+            except Exception:
+                pass
+    if verified_on_connection:
+        return True
+    try:
+        connection.close()
+    except Exception:
+        pass
+    try:
+        with _read_connection(canonical) as reopened:
+            _verify_connection(
+                reopened,
+                expected_pilot_id=expected_pilot_id,
+                expected_ledger_id=expected_ledger_id,
+            )
+            _ensure_path_identity(canonical, anchor, expected_links=1)
+        return True
+    except Exception:
+        return False
+
+
+def _activate_staged_ledger(
+    destination: Path,
+    *,
+    candidate_digest: str,
+    expected_pilot_id: str,
+    expected_ledger_id: str,
+) -> None:
+    _reject_destination_sidecars(destination)
+    canonical = _canonical_existing_file(destination, label="ledger database")
+    with _identity_anchor(canonical) as anchor:
+        if sha256_file(canonical).sha256 != candidate_digest:
+            raise ValueError("staged ledger digest mismatch")
+        _ensure_path_identity(canonical, anchor, expected_links=1)
+        uri = f"{canonical.as_uri()}?mode=rw"
+        connection = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=BUSY_TIMEOUT_MILLISECONDS / 1_000,
+            isolation_level=None,
+        )
+        committed = False
+        try:
+            _configure_connection(connection)
+            connection.execute("PRAGMA synchronous = FULL")
+            _begin_immediate(connection)
+            _reject_destination_sidecars(canonical)
+            if sha256_file(canonical).sha256 != candidate_digest:
+                raise ValueError("staged ledger digest mismatch")
+            _ensure_path_identity(canonical, anchor, expected_links=1)
+            _verify_connection(
+                connection,
+                expected_pilot_id=expected_pilot_id,
+                expected_ledger_id=expected_ledger_id,
+                staged=True,
+            )
+            _ensure_path_identity(canonical, anchor, expected_links=1)
+            cursor = connection.execute(
+                """
+                UPDATE pilot SET schema_version = ?
+                WHERE singleton = 1 AND schema_version = ?
+                """,
+                (LEDGER_SCHEMA_VERSION, STAGED_LEDGER_SCHEMA_VERSION),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("staged ledger activation mismatch")
+            connection.execute(f"PRAGMA user_version = {SQLITE_USER_VERSION}")
+            _create_immutability_triggers(connection)
+            _verify_connection(
+                connection,
+                expected_pilot_id=expected_pilot_id,
+                expected_ledger_id=expected_ledger_id,
+            )
+            _ensure_path_identity(canonical, anchor, expected_links=1)
+            try:
+                connection.commit()
+            except Exception:
+                committed = _commit_error_left_verified_final_ledger(
+                    connection,
+                    canonical,
+                    anchor,
+                    expected_pilot_id=expected_pilot_id,
+                    expected_ledger_id=expected_ledger_id,
+                )
+                if not committed:
+                    raise
+            else:
+                committed = True
+        except Exception:
+            if connection.in_transaction:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+            try:
+                connection.close()
+            except Exception:
+                pass
+            raise
+        finally:
+            if committed:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+
 def migrate_legacy_ledger(
     source_ledger_path: Path,
     manifest_path: Path,
@@ -1422,7 +1742,6 @@ def migrate_legacy_ledger(
     temporary: Path | None = None
     temporary_base: Path | None = None
     published = False
-    quarantined = False
     try:
         file_descriptor, name = tempfile.mkstemp(
             prefix=f".{destination.name}.",
@@ -1436,19 +1755,20 @@ def migrate_legacy_ledger(
         with temporary.open("r+b") as database_file:
             os.fsync(database_file.fileno())
         try:
-            PilotLedger.open_existing(
+            candidate_digest, candidate_anchor = _verify_staged_candidate(
                 temporary,
-                manifest["pilot_id"],
+                expected_pilot_id=manifest["pilot_id"],
                 expected_ledger_id=manifest["ledger_id"],
             )
         except Exception:
             raise ValueError("ledger publication verification failed") from None
+
         result = PilotLedger(
             destination,
             manifest["pilot_id"],
             manifest["ledger_id"],
         )
-        result.ledger_id = manifest["ledger_id"]
+        _preflight_destination_entries(destination)
         try:
             os.link(temporary, destination)
         except FileExistsError:
@@ -1456,41 +1776,39 @@ def migrate_legacy_ledger(
         except OSError as exc:
             raise ValueError("ledger publication failed") from exc
         published = True
+        _verify_linked_staged_destination(
+            destination,
+            candidate_anchor=candidate_anchor,
+            candidate_digest=candidate_digest,
+            expected_pilot_id=manifest["pilot_id"],
+            expected_ledger_id=manifest["ledger_id"],
+        )
         temporary.unlink()
         temporary = None
+        temporary_base = None
+        _activate_staged_ledger(
+            destination,
+            candidate_digest=candidate_digest,
+            expected_pilot_id=manifest["pilot_id"],
+            expected_ledger_id=manifest["ledger_id"],
+        )
         return result
     except Exception:
         if published:
             try:
                 destination.unlink(missing_ok=True)
             except OSError:
-                try:
-                    quarantined = (
-                        temporary_base is not None
-                        and temporary_base.exists()
-                        and destination.exists()
-                        and os.path.samefile(temporary_base, destination)
-                        and destination.stat().st_nlink >= 2
-                    )
-                except OSError:
-                    quarantined = False
-                if not quarantined:
-                    raise RuntimeError("ledger migration quarantine failed") from None
-            for suffix in ("-journal", "-wal", "-shm"):
-                try:
-                    Path(f"{destination}{suffix}").unlink(missing_ok=True)
-                except OSError:
-                    pass
+                pass
             raise ValueError("ledger publication failed safely") from None
         raise
     finally:
-        if temporary is not None and not quarantined:
+        if temporary is not None:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
-        if temporary_base is not None and not quarantined:
-            for suffix in ("-journal", "-wal", "-shm"):
+        if temporary_base is not None:
+            for suffix in SQLITE_SIDECAR_SUFFIXES:
                 try:
                     Path(f"{temporary_base}{suffix}").unlink(missing_ok=True)
                 except OSError:
