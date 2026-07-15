@@ -124,6 +124,106 @@ def _migrate_fixture(tmp_path: Path) -> tuple[PilotLedger, Path, Path, Path]:
     return ledger, source_path, manifest_path, ledger_path
 
 
+def _install_commit_then_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    readback_close_raises: bool = False,
+) -> dict[str, Any]:
+    original_connect = sqlite3.connect
+    observed: dict[str, Any] = {
+        "write_connections": 0,
+        "commit_applied": False,
+        "write_connection_unusable": False,
+        "fresh_readback_opened": False,
+        "exact_event_readback": False,
+        "exact_reservation_readback": False,
+        "readback_close_called": False,
+        "readback_close_raised": False,
+    }
+
+    class CommitThenDisconnectConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        @property
+        def in_transaction(self) -> bool:
+            return False
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+        def commit(self) -> None:
+            self._connection.commit()
+            observed["commit_applied"] = True
+            self._connection.close()
+            try:
+                self._connection.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                observed["write_connection_unusable"] = True
+            else:
+                raise AssertionError("write connection remained usable after close")
+            raise sqlite3.OperationalError("synthetic write connection loss after commit")
+
+    class TrackedReadbackConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+        def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+            normalized = " ".join(sql.split()).casefold()
+            if "from events where event_id = ?" in normalized:
+                observed["exact_event_readback"] = True
+            if "from reservations where reservation_id = ?" in normalized:
+                observed["exact_reservation_readback"] = True
+            return self._connection.execute(sql, *args, **kwargs)
+
+        def close(self) -> None:
+            observed["readback_close_called"] = True
+            self._connection.close()
+            if readback_close_raises:
+                observed["readback_close_raised"] = True
+                raise OSError("synthetic write-effect readback close failure")
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        connection = original_connect(*args, **kwargs)
+        target = args[0] if args else kwargs.get("database")
+        if isinstance(target, str) and target.endswith("?mode=rw"):
+            observed["write_connections"] += 1
+            if observed["write_connections"] == 1:
+                return CommitThenDisconnectConnection(connection)
+        if (
+            observed["commit_applied"]
+            and not observed["fresh_readback_opened"]
+            and isinstance(target, str)
+            and target.endswith("?mode=ro")
+        ):
+            observed["fresh_readback_opened"] = True
+            return TrackedReadbackConnection(connection)
+        return connection
+
+    monkeypatch.setattr(pilot_ledger.sqlite3, "connect", connect)
+    return observed
+
+
+def _last_event_row(ledger_path: Path, reservation_id: str) -> tuple[Any, ...]:
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        row = connection.execute(
+            """
+            SELECT event_id, from_state, to_state, amount_usd,
+                   reason_code, evidence_sha256
+            FROM events
+            WHERE reservation_id = ?
+            ORDER BY event_index DESC
+            LIMIT 1
+            """,
+            (reservation_id,),
+        ).fetchone()
+    assert row is not None
+    return row
+
+
 def _drop_immutability_triggers(connection: sqlite3.Connection) -> None:
     names = connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name"
@@ -946,6 +1046,110 @@ def test_activation_reopens_to_classify_commit_after_connection_loss(
     assert ledger.remaining() == Decimal("8.4591")
 
 
+def test_verified_final_readback_close_failure_preserves_commit_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path, manifest_path, ledger_path = _write_fixture(tmp_path)
+    original_connect = sqlite3.connect
+    original_unlink = Path.unlink
+    activation_commit_applied = False
+    activation_connection_unusable = False
+    final_readback_wrapped = False
+    final_readback_verified = False
+    final_readback_close_raised = False
+    destination_cleanup_denied = False
+
+    class CommitThenDisconnectConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        @property
+        def in_transaction(self) -> bool:
+            return False
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+        def commit(self) -> None:
+            nonlocal activation_commit_applied, activation_connection_unusable
+            self._connection.commit()
+            activation_commit_applied = True
+            self._connection.close()
+            try:
+                self._connection.execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                activation_connection_unusable = True
+            else:
+                raise AssertionError("activation connection remained usable after close")
+            raise sqlite3.OperationalError("synthetic connection loss after commit")
+
+    class CloseThenRaiseFinalReadbackConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+        def close(self) -> None:
+            nonlocal final_readback_verified, final_readback_close_raised
+            assert self._connection.execute("PRAGMA user_version").fetchone() == (
+                pilot_ledger.SQLITE_USER_VERSION,
+            )
+            assert self._connection.execute(
+                "SELECT schema_version FROM pilot WHERE singleton = 1"
+            ).fetchone() == (pilot_ledger.LEDGER_SCHEMA_VERSION,)
+            final_readback_verified = True
+            self._connection.close()
+            final_readback_close_raised = True
+            raise OSError("synthetic FINAL readback close failure")
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        nonlocal final_readback_wrapped
+        connection = original_connect(*args, **kwargs)
+        target = args[0] if args else kwargs.get("database")
+        if isinstance(target, str) and target.endswith("?mode=rw"):
+            return CommitThenDisconnectConnection(connection)
+        if (
+            activation_commit_applied
+            and not final_readback_wrapped
+            and isinstance(target, str)
+            and target.endswith("?mode=ro")
+        ):
+            final_readback_wrapped = True
+            return CloseThenRaiseFinalReadbackConnection(connection)
+        return connection
+
+    def refuse_destination_cleanup(
+        path: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        nonlocal destination_cleanup_denied
+        if path == ledger_path:
+            destination_cleanup_denied = True
+            raise PermissionError("synthetic destination cleanup lock")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(pilot_ledger.sqlite3, "connect", connect)
+    monkeypatch.setattr(Path, "unlink", refuse_destination_cleanup)
+
+    ledger = migrate_legacy_ledger(source_path, manifest_path, ledger_path)
+
+    assert activation_commit_applied is True
+    assert activation_connection_unusable is True
+    assert final_readback_wrapped is True
+    assert final_readback_verified is True
+    assert final_readback_close_raised is True
+    assert ledger.verify_integrity() is True
+    with pytest.raises(PermissionError, match="synthetic destination cleanup lock"):
+        ledger_path.unlink()
+    assert destination_cleanup_denied is True
+    assert ledger_path.exists()
+    assert ledger.verify_integrity() is True
+    assert ledger.remaining() == Decimal("8.4591")
+
+
 def test_activation_close_failure_after_commit_cannot_reverse_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1404,6 +1608,275 @@ def test_reservation_uses_task1_bundle_sha_exact_money_and_derived_balance(
     assert ledger.state(reservation.id) == "reserved"
     assert ledger.committed() == Decimal("9.5409")
     assert ledger.remaining() == Decimal("2.4591")
+
+
+def test_reserve_recovers_exact_effect_after_commit_connection_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    observed = _install_commit_then_disconnect(
+        monkeypatch,
+        readback_close_raises=True,
+    )
+    bundle_id = _bundle_id(100)
+    execution_id = _typed_id("exec", 100)
+
+    reservation = ledger.reserve(bundle_id, execution_id, Decimal("0.1000"))
+
+    assert observed == {
+        "write_connections": 1,
+        "commit_applied": True,
+        "write_connection_unusable": True,
+        "fresh_readback_opened": True,
+        "exact_event_readback": True,
+        "exact_reservation_readback": True,
+        "readback_close_called": True,
+        "readback_close_raised": True,
+    }
+    assert reservation.bundle_id == bundle_id
+    assert reservation.execution_id == execution_id
+    assert reservation.amount == Decimal("0.1000")
+    assert ledger.state(reservation.id) == "reserved"
+    with closing(sqlite3.connect(ledger_path)) as connection:
+        stored_reservation = connection.execute(
+            """
+            SELECT reservation_id, bundle_id, execution_id, amount_usd, migration_id
+            FROM reservations WHERE reservation_id = ?
+            """,
+            (reservation.id,),
+        ).fetchone()
+    assert stored_reservation == (
+        reservation.id,
+        bundle_id,
+        execution_id,
+        "0.1000",
+        None,
+    )
+    event = _last_event_row(ledger_path, reservation.id)
+    assert event[0].startswith("event_")
+    assert event[1:] == (
+        None,
+        "reserved",
+        "0.1000",
+        "reservation_created",
+        None,
+    )
+    assert ledger.remaining() == Decimal("8.3591")
+
+
+def test_transition_recovers_exact_effect_after_commit_connection_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    reservation = ledger.reserve(
+        _bundle_id(100),
+        _typed_id("exec", 100),
+        Decimal("0.1000"),
+    )
+    ledger.transition(reservation.id, "uploading")
+    observed = _install_commit_then_disconnect(monkeypatch)
+
+    ledger.transition(reservation.id, "submit_started")
+
+    assert observed["write_connections"] == 1
+    assert observed["commit_applied"] is True
+    assert observed["write_connection_unusable"] is True
+    assert observed["fresh_readback_opened"] is True
+    assert observed["exact_event_readback"] is True
+    assert observed["exact_reservation_readback"] is False
+    assert observed["readback_close_called"] is True
+    assert ledger.state(reservation.id) == "submit_started"
+    event = _last_event_row(ledger_path, reservation.id)
+    assert event[0].startswith("event_")
+    assert event[1:] == (
+        "uploading",
+        "submit_started",
+        "0.1000",
+        "state_transition",
+        None,
+    )
+
+
+def test_release_recovers_exact_effect_after_commit_connection_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    reservation = ledger.reserve(
+        _bundle_id(100),
+        _typed_id("exec", 100),
+        Decimal("0.1000"),
+    )
+    ledger.transition(reservation.id, "uploading")
+    observed = _install_commit_then_disconnect(monkeypatch)
+
+    ledger.release_pre_submit(reservation.id, "synthetic pre-submit failure")
+
+    assert observed["write_connections"] == 1
+    assert observed["commit_applied"] is True
+    assert observed["write_connection_unusable"] is True
+    assert observed["fresh_readback_opened"] is True
+    assert observed["exact_event_readback"] is True
+    assert observed["exact_reservation_readback"] is False
+    assert observed["readback_close_called"] is True
+    assert ledger.state(reservation.id) == "released"
+    event = _last_event_row(ledger_path, reservation.id)
+    assert event[0].startswith("event_")
+    assert event[1:] == (
+        "uploading",
+        "released",
+        "0.1000",
+        "pre_submit_release",
+        None,
+    )
+    assert ledger.remaining() == Decimal("8.4591")
+
+
+def test_reconcile_recovers_exact_effect_after_commit_connection_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, ledger_path = _migrate_fixture(tmp_path)
+    reservation = ledger.reserve(
+        _bundle_id(100),
+        _typed_id("exec", 100),
+        Decimal("0.1000"),
+    )
+    for state in ("uploading", "submit_started", "submitted"):
+        ledger.transition(reservation.id, state)
+    evidence = hashlib.sha256(b"synthetic reconciliation evidence").hexdigest()
+    observed = _install_commit_then_disconnect(monkeypatch)
+
+    ledger.reconcile(reservation.id, "consumed", evidence_sha256=evidence)
+
+    assert observed["write_connections"] == 1
+    assert observed["commit_applied"] is True
+    assert observed["write_connection_unusable"] is True
+    assert observed["fresh_readback_opened"] is True
+    assert observed["exact_event_readback"] is True
+    assert observed["exact_reservation_readback"] is False
+    assert observed["readback_close_called"] is True
+    assert ledger.state(reservation.id) == "consumed"
+    event = _last_event_row(ledger_path, reservation.id)
+    assert event[0].startswith("event_")
+    assert event[1:] == (
+        "submitted",
+        "consumed",
+        "0.1000",
+        "provider_reconciliation",
+        evidence,
+    )
+    assert ledger.remaining() == Decimal("8.3591")
+
+
+def test_write_failure_rolls_back_and_preserves_primary_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, _ = _migrate_fixture(tmp_path)
+    original_connect = sqlite3.connect
+    observed = {
+        "write_connections": 0,
+        "commit_failed_while_active": False,
+        "rollback_attempted": False,
+        "close_attempted": False,
+        "fresh_readback_opened": False,
+    }
+
+    class FailCommitAndCleanupConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+        def commit(self) -> None:
+            observed["commit_failed_while_active"] = self._connection.in_transaction
+            raise sqlite3.OperationalError("synthetic write commit failure before effect")
+
+        def rollback(self) -> None:
+            observed["rollback_attempted"] = True
+            self._connection.rollback()
+            raise OSError("synthetic rollback cleanup failure")
+
+        def close(self) -> None:
+            observed["close_attempted"] = True
+            self._connection.close()
+            raise OSError("synthetic write close cleanup failure")
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        connection = original_connect(*args, **kwargs)
+        target = args[0] if args else kwargs.get("database")
+        if isinstance(target, str) and target.endswith("?mode=rw"):
+            observed["write_connections"] += 1
+            if observed["write_connections"] == 1:
+                return FailCommitAndCleanupConnection(connection)
+        if isinstance(target, str) and target.endswith("?mode=ro"):
+            observed["fresh_readback_opened"] = True
+        return connection
+
+    monkeypatch.setattr(pilot_ledger.sqlite3, "connect", connect)
+    bundle_id = _bundle_id(100)
+    execution_id = _typed_id("exec", 100)
+
+    with pytest.raises(
+        sqlite3.OperationalError,
+        match="synthetic write commit failure before effect",
+    ):
+        ledger.reserve(bundle_id, execution_id, Decimal("0.1000"))
+
+    assert observed["write_connections"] == 1
+    assert observed["commit_failed_while_active"] is True
+    assert observed["rollback_attempted"] is True
+    assert observed["close_attempted"] is True
+    assert observed["fresh_readback_opened"] is False
+    assert ledger.remaining() == Decimal("8.4591")
+    reservation = ledger.reserve(bundle_id, execution_id, Decimal("0.1000"))
+    assert ledger.state(reservation.id) == "reserved"
+
+
+def test_write_close_failure_after_acknowledged_commit_preserves_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, _, _, _ = _migrate_fixture(tmp_path)
+    original_connect = sqlite3.connect
+    observed = {"write_connections": 0, "close_raised": False}
+
+    class CloseThenRaiseConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._connection, name)
+
+        def close(self) -> None:
+            self._connection.close()
+            observed["close_raised"] = True
+            raise OSError("synthetic acknowledged-write close failure")
+
+    def connect(*args: Any, **kwargs: Any) -> Any:
+        connection = original_connect(*args, **kwargs)
+        target = args[0] if args else kwargs.get("database")
+        if isinstance(target, str) and target.endswith("?mode=rw"):
+            observed["write_connections"] += 1
+            if observed["write_connections"] == 1:
+                return CloseThenRaiseConnection(connection)
+        return connection
+
+    monkeypatch.setattr(pilot_ledger.sqlite3, "connect", connect)
+
+    reservation = ledger.reserve(
+        _bundle_id(100),
+        _typed_id("exec", 100),
+        Decimal("0.1000"),
+    )
+
+    assert observed == {"write_connections": 1, "close_raised": True}
+    assert ledger.state(reservation.id) == "reserved"
+    assert ledger.remaining() == Decimal("8.3591")
 
 
 @pytest.mark.parametrize(
