@@ -12,7 +12,12 @@ from typing import Any, Callable, Mapping
 from urllib import request as urllib_request
 
 from .a2v_bundle import compute_bundle_id
-from .artifacts import canonical_json_bytes, sha256_file, strict_load_json
+from .artifacts import (
+    canonical_json_bytes,
+    safe_relative_name,
+    sha256_file,
+    strict_load_json,
+)
 
 
 A2V_ENDPOINT = "fal-ai/ltx23-trainer-v2/a2v"
@@ -26,6 +31,7 @@ CUMULATIVE_CAP_USD = "12.0000"
 APPROVAL_SCHEMA_VERSION = "a2v-execution-approval-v1"
 APPROVAL_STATUS = "approved_for_paid_execution"
 APPROVAL_MODE = "standing_policy"
+EXECUTION_CONFIG_SCHEMA_VERSION = "a2v-execution-config-v1"
 PRICE_EVIDENCE_MAX_AGE = timedelta(hours=24)
 PRICE_FETCH_TIMEOUT_SECONDS = 10
 MAX_PRICE_RESPONSE_BYTES = 1_048_576
@@ -92,31 +98,73 @@ EXECUTION_RECEIPT_FIELDS = frozenset(
         "steps",
     }
 )
-EXECUTION_CONFIG_REQUIRED_FIELDS = frozenset(
+EXECUTION_CONFIG_FIELDS = frozenset(
     {
+        "schema_version",
+        "canonical_json_version",
         "execution_id",
+        "pilot_id",
+        "ledger_id",
+        "created_at_utc",
+        "expires_at_utc",
         "endpoint",
+        "trigger_phrase",
+        "rank",
         "steps",
+        "learning_rate",
+        "training_frames",
+        "training_fps",
+        "resolution",
+        "aspect_ratio",
+        "auto_scale_input",
+        "split_input_into_scenes",
+        "audio_normalize",
+        "audio_preserve_pitch",
+        "debug_dataset",
+        "negative_prompt",
+        "validation",
+        "dataset_manifest_sha256",
+        "training_archive_sha256",
+        "standing_authorization_sha256",
+        "price_evidence_sha256",
+        "price_source_url",
+        "rate_usd_per_step",
         "training_max_usd",
         "validation_allocation_usd",
         "cumulative_cap_usd",
-        "pilot_id",
-        "ledger_id",
     }
 )
+VALIDATION_ENTRY_FIELDS = frozenset(
+    {
+        "image_filename",
+        "image_sha256",
+        "audio_filename",
+        "audio_sha256",
+        "prompt",
+        "frames",
+        "fps",
+        "resolution",
+        "aspect_ratio",
+    }
+)
+TRIGGER_PHRASE_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{2,63}", re.ASCII)
 RATE_FORMULA_PATTERN = re.compile(
     r"(?<![0-9.])(?P<currency>\$?)(?P<rate>[0-9]+\.[0-9]+)"
     r"\s*\*\s*steps\b",
     re.IGNORECASE | re.ASCII,
 )
 COST_AFTER_STEPS_PATTERN = re.compile(
-    r"\b1,000\s+steps\b.{0,80}?\$(?P<cost>[0-9]+\.[0-9]+)",
+    r"\b1,?000\s+steps\b.{0,80}?\$(?P<cost>[0-9]+\.[0-9]+)",
     re.IGNORECASE | re.ASCII | re.DOTALL,
 )
 COST_BEFORE_STEPS_PATTERN = re.compile(
     r"\$(?P<cost>[0-9]+\.[0-9]+)(?![0-9.])(?!\s*\*\s*steps)"
-    r".{0,80}?\b(?:for\s+)?1,000\s+steps\b",
+    r".{0,80}?\b(?:for\s+)?1,?000\s+steps\b",
     re.IGNORECASE | re.ASCII | re.DOTALL,
+)
+MODEL_ENDPOINT_PATTERN = re.compile(
+    r"fal-ai/[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*",
+    re.IGNORECASE | re.ASCII,
 )
 
 
@@ -174,6 +222,154 @@ def _money(value: Any, *, label: str) -> Decimal:
         return Decimal(value)
     except InvalidOperation as exc:
         raise ValueError(f"{label} must use four decimal places") from exc
+
+
+def _canonical_text(value: Any, *, label: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or len(value) > 4_096
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError(f"{label} must be canonical non-empty text")
+    return value
+
+
+def _canonical_local_filename(value: Any, *, label: str, suffix: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{label} must be a canonical local filename")
+    try:
+        safe_relative_name(value)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a canonical local filename") from exc
+    if "/" in value or not value.endswith(suffix):
+        raise ValueError(f"{label} must be a canonical local filename")
+    return value
+
+
+def _validate_validation_entries(value: Any) -> list[dict[str, Any]]:
+    if type(value) is not list or len(value) != 2:
+        raise ValueError("execution configuration requires exactly two validation entries")
+    entries: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        entry = _exact_dict(
+            item,
+            VALIDATION_ENTRY_FIELDS,
+            label=f"validation entry {index}",
+        )
+        _canonical_local_filename(
+            entry["image_filename"],
+            label="validation image_filename",
+            suffix=".png",
+        )
+        _sha256(entry["image_sha256"], label="image_sha256")
+        _canonical_local_filename(
+            entry["audio_filename"],
+            label="validation audio_filename",
+            suffix=".wav",
+        )
+        _sha256(entry["audio_sha256"], label="audio_sha256")
+        _canonical_text(entry["prompt"], label="validation prompt")
+        if type(entry["frames"]) is not int or entry["frames"] != 89:
+            raise ValueError("validation frames mismatch")
+        if type(entry["fps"]) is not int or entry["fps"] != 24:
+            raise ValueError("validation fps mismatch")
+        if type(entry["resolution"]) is not str or entry["resolution"] != "high":
+            raise ValueError("validation resolution mismatch")
+        if type(entry["aspect_ratio"]) is not str or entry["aspect_ratio"] != "9:16":
+            raise ValueError("validation aspect ratio mismatch")
+        entries.append(entry)
+    canonical_entries = sorted(
+        entries,
+        key=lambda entry: (entry["image_filename"], entry["audio_filename"]),
+    )
+    image_names = {entry["image_filename"] for entry in entries}
+    audio_names = {entry["audio_filename"] for entry in entries}
+    if entries != canonical_entries or len(image_names) != 2 or len(audio_names) != 2:
+        raise ValueError("execution configuration requires canonical validation order")
+    return entries
+
+
+def _validate_execution_config(value: Any) -> dict[str, Any]:
+    data = _exact_dict(
+        value,
+        EXECUTION_CONFIG_FIELDS,
+        label="execution configuration",
+    )
+    if data["schema_version"] != EXECUTION_CONFIG_SCHEMA_VERSION:
+        raise ValueError("execution configuration schema mismatch")
+    if (
+        type(data["canonical_json_version"]) is not int
+        or data["canonical_json_version"] != 1
+    ):
+        raise ValueError("execution configuration canonical JSON version mismatch")
+    _typed_id(data["execution_id"], EXECUTION_ID_PATTERN, label="execution_id")
+    _typed_id(data["pilot_id"], PILOT_ID_PATTERN, label="pilot_id")
+    _typed_id(data["ledger_id"], LEDGER_ID_PATTERN, label="ledger_id")
+    created = _parse_utc_timestamp(
+        data["created_at_utc"],
+        label="execution configuration created_at_utc",
+    )
+    expires = _parse_utc_timestamp(
+        data["expires_at_utc"],
+        label="execution configuration expires_at_utc",
+    )
+    if expires <= created:
+        raise ValueError(
+            "execution configuration expires_at_utc must be after created_at_utc"
+        )
+    if type(data["endpoint"]) is not str or data["endpoint"] != A2V_ENDPOINT:
+        raise ValueError("endpoint mismatch")
+    if (
+        type(data["trigger_phrase"]) is not str
+        or TRIGGER_PHRASE_PATTERN.fullmatch(data["trigger_phrase"]) is None
+    ):
+        raise ValueError("execution configuration requires a neutral trigger phrase")
+    if type(data["rank"]) is not int or data["rank"] != 32:
+        raise ValueError("execution configuration rank mismatch")
+    if type(data["steps"]) is not int or data["steps"] != A2V_STEPS:
+        raise ValueError("step count mismatch")
+    if type(data["learning_rate"]) is not str or data["learning_rate"] != "0.0002":
+        raise ValueError("execution configuration learning rate mismatch")
+    if type(data["training_frames"]) is not int or data["training_frames"] != 89:
+        raise ValueError("execution configuration training frames mismatch")
+    if type(data["training_fps"]) is not int or data["training_fps"] != 24:
+        raise ValueError("execution configuration training fps mismatch")
+    if type(data["resolution"]) is not str or data["resolution"] != "high":
+        raise ValueError("execution configuration resolution mismatch")
+    if type(data["aspect_ratio"]) is not str or data["aspect_ratio"] != "9:16":
+        raise ValueError("execution configuration aspect ratio mismatch")
+    if data["auto_scale_input"] is not False:
+        raise ValueError("execution configuration auto-scale mismatch")
+    if data["split_input_into_scenes"] is not False:
+        raise ValueError("execution configuration split-scenes mismatch")
+    if data["audio_normalize"] is not True:
+        raise ValueError("execution configuration audio normalization mismatch")
+    if data["audio_preserve_pitch"] is not True:
+        raise ValueError("execution configuration pitch preservation mismatch")
+    if data["debug_dataset"] is not False:
+        raise ValueError("execution configuration debug_dataset must be false")
+    _canonical_text(data["negative_prompt"], label="negative_prompt")
+    _validate_validation_entries(data["validation"])
+    for field in (
+        "dataset_manifest_sha256",
+        "training_archive_sha256",
+        "standing_authorization_sha256",
+        "price_evidence_sha256",
+    ):
+        _sha256(data[field], label=field)
+    if data["price_source_url"] != OFFICIAL_PRICE_URL:
+        raise ValueError("execution configuration price source URL mismatch")
+    if data["rate_usd_per_step"] != A2V_RATE_USD_PER_STEP:
+        raise ValueError("execution configuration price rate mismatch")
+    if data["training_max_usd"] != TRAINING_MAX_USD:
+        raise ValueError("training ceiling mismatch")
+    if data["validation_allocation_usd"] != VALIDATION_ALLOCATION_MAX_USD:
+        raise ValueError("validation allocation mismatch")
+    if data["cumulative_cap_usd"] != CUMULATIVE_CAP_USD:
+        raise ValueError("cumulative cap mismatch")
+    return data
 
 
 @dataclass(frozen=True)
@@ -292,7 +488,10 @@ class _OfficialPriceRedirectHandler(urllib_request.HTTPRedirectHandler):
 def _fetch_official_price(url: str) -> bytes:
     if type(url) is not str or url != OFFICIAL_PRICE_URL:
         raise ValueError("price fetch requires the official HTTPS URL")
-    opener = urllib_request.build_opener(_OfficialPriceRedirectHandler())
+    opener = urllib_request.build_opener(
+        urllib_request.ProxyHandler({}),
+        _OfficialPriceRedirectHandler(),
+    )
     request = urllib_request.Request(
         url,
         headers={"Accept": "text/html,application/xhtml+xml"},
@@ -308,24 +507,39 @@ def _fetch_official_price(url: str) -> bytes:
     return content
 
 
+def _a2v_price_contexts(text: str) -> list[str]:
+    markers = list(MODEL_ENDPOINT_PATTERN.finditer(text))
+    if not markers:
+        return [text]
+    contexts: list[str] = []
+    for index, marker in enumerate(markers):
+        if marker.group(0).lower() != A2V_ENDPOINT:
+            continue
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
+        contexts.append(text[marker.start() : end])
+    return contexts
+
+
 def _verify_price_statement(content: bytes) -> None:
     try:
         text = content.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         raise ValueError("official price response must be UTF-8") from exc
-    formulas = list(RATE_FORMULA_PATTERN.finditer(text))
-    if (
-        len(formulas) != 1
-        or formulas[0].group("currency") != "$"
-        or formulas[0].group("rate") != A2V_RATE_USD_PER_STEP
-    ):
+    contexts = _a2v_price_contexts(text)
+    rates = {
+        match.group("rate")
+        for context in contexts
+        for match in RATE_FORMULA_PATTERN.finditer(context)
+    }
+    if rates != {A2V_RATE_USD_PER_STEP}:
         raise ValueError("unexpected A2V rate")
-    costs = [
+    costs = {
         match.group("cost")
+        for context in contexts
         for pattern in (COST_AFTER_STEPS_PATTERN, COST_BEFORE_STEPS_PATTERN)
-        for match in pattern.finditer(text)
-    ]
-    if costs != ["6.00"]:
+        for match in pattern.finditer(context)
+    }
+    if costs != {"6.00"}:
         raise ValueError("unexpected 1,000-step cost")
 
 
@@ -481,6 +695,17 @@ def _require_regular_file(path: Path) -> None:
         raise ValueError("private bundle input is unavailable")
 
 
+def _ensure_distinct_files(paths: list[Path]) -> None:
+    for index, left in enumerate(paths):
+        for right in paths[index + 1 :]:
+            try:
+                aliases = left.samefile(right)
+            except OSError as exc:
+                raise ValueError("private bundle input is unavailable") from exc
+            if aliases:
+                raise ValueError("root-bound files must not alias")
+
+
 def _load_canonical_object(path: Path) -> dict[str, Any]:
     _require_regular_file(path)
     value = strict_load_json(path)
@@ -522,34 +747,45 @@ def _load_bundle(
     _require_directory(run_path)
     control_dir = run_path / "control"
     bundle_dir = run_path / "bundle"
+    validation_dir = run_path / "validation"
     _require_directory(control_dir)
     _require_directory(bundle_dir)
+    _require_directory(validation_dir)
 
     plan_path = run_path / "plan.md"
     policy_path = control_dir / "standing-authorization.json"
     price_path = control_dir / "price-evidence.json"
     config_path = control_dir / "execution-config.json"
+    structural_path = control_dir / "structural-report.json"
+    quality_path = control_dir / "quality-attestation.json"
+    selection_path = validation_dir / "provider-validation-selection.json"
     root_path = bundle_dir / "bundle-manifest.json"
     dataset_path = bundle_dir / "dataset-manifest.json"
     archive_path = bundle_dir / "training-data.zip"
-    for path in (
-        plan_path,
-        policy_path,
-        price_path,
-        config_path,
-        root_path,
-        dataset_path,
-        archive_path,
-    ):
+    root_bound_paths = {
+        "plan": plan_path,
+        "standing_authorization": policy_path,
+        "price_evidence": price_path,
+        "structural_report": structural_path,
+        "quality_attestation": quality_path,
+        "execution_config": config_path,
+        "provider_validation_selection": selection_path,
+        "dataset_manifest": dataset_path,
+        "training_archive": archive_path,
+    }
+    for path in (root_path, *root_bound_paths.values()):
         _require_regular_file(path)
+    _ensure_distinct_files(list(root_bound_paths.values()))
 
     on_disk_policy = StandingAuthorization.from_dict(
         _load_canonical_object(policy_path), now=current
     )
     price = PriceEvidence.from_dict(_load_canonical_object(price_path), now=current)
-    config = _load_canonical_object(config_path)
-    if not EXECUTION_CONFIG_REQUIRED_FIELDS.issubset(config):
-        raise ValueError("execution configuration is missing required fields")
+    config = _validate_execution_config(_load_canonical_object(config_path))
+    _load_canonical_object(structural_path)
+    _load_canonical_object(quality_path)
+    _load_canonical_object(selection_path)
+    _load_canonical_object(dataset_path)
     root_manifest = _load_canonical_object(root_path)
     bundle_id = compute_bundle_id(root_manifest)
     if expected_bundle_id is not None:
@@ -561,41 +797,67 @@ def _load_bundle(
     )
     if root_expiry <= current:
         raise ValueError("bundle expired")
+    if config["created_at_utc"] != root_manifest["created_at_utc"]:
+        raise ValueError("execution configuration creation timestamp mismatch")
+    if config["expires_at_utc"] != root_manifest["expires_at_utc"]:
+        raise ValueError("execution configuration expiry timestamp mismatch")
+    policy_expiry = _parse_utc_timestamp(
+        policy.expires_at_utc,
+        label="policy expires_at_utc",
+    )
+    price_expiry = _parse_utc_timestamp(
+        price.expires_at_utc,
+        label="price expires_at_utc",
+    )
+    if root_expiry > policy_expiry:
+        raise ValueError("bundle expiry exceeds policy expiry")
+    if root_expiry > price_expiry:
+        raise ValueError("bundle expiry exceeds price evidence expiry")
 
     root_artifacts = root_manifest["artifacts"]
-    policy_sha256 = _expected_digest(
-        policy_path,
-        root_artifacts["standing_authorization"],
-        label="standing authorization",
-    )
+    labels = {
+        "plan": "plan",
+        "standing_authorization": "standing authorization",
+        "price_evidence": "price evidence",
+        "structural_report": "structural report",
+        "quality_attestation": "quality attestation",
+        "execution_config": "execution configuration",
+        "provider_validation_selection": "provider validation selection",
+        "dataset_manifest": "dataset manifest",
+        "training_archive": "training archive",
+    }
+    artifact_sha256 = {
+        role: _expected_digest(
+            path,
+            root_artifacts[role],
+            label=labels[role],
+        )
+        for role, path in root_bound_paths.items()
+    }
+    policy_sha256 = artifact_sha256["standing_authorization"]
+    price_sha256 = artifact_sha256["price_evidence"]
+    plan_sha256 = artifact_sha256["plan"]
+    dataset_sha256 = artifact_sha256["dataset_manifest"]
+    archive_sha256 = artifact_sha256["training_archive"]
+    config_sha256 = artifact_sha256["execution_config"]
     passed_policy_sha256 = hashlib.sha256(
         canonical_json_bytes(policy.to_dict())
     ).hexdigest()
     if passed_policy_sha256 != policy_sha256 or on_disk_policy != policy:
         raise ValueError("standing authorization hash mismatch")
-    _expected_digest(
-        price_path,
-        root_artifacts["price_evidence"],
-        label="price evidence",
-    )
-    plan_sha256 = _expected_digest(
-        plan_path, root_artifacts["plan"], label="plan"
-    )
-    dataset_sha256 = _expected_digest(
-        dataset_path,
-        root_artifacts["dataset_manifest"],
-        label="dataset manifest",
-    )
-    archive_sha256 = _expected_digest(
-        archive_path,
-        root_artifacts["training_archive"],
-        label="training archive",
-    )
-    config_sha256 = _expected_digest(
-        config_path,
-        root_artifacts["execution_config"],
-        label="execution configuration",
-    )
+
+    if config["standing_authorization_sha256"] != policy_sha256:
+        raise ValueError("standing authorization config hash mismatch")
+    if config["price_evidence_sha256"] != price_sha256:
+        raise ValueError("price evidence config hash mismatch")
+    if config["dataset_manifest_sha256"] != dataset_sha256:
+        raise ValueError("dataset manifest hash mismatch")
+    if config["training_archive_sha256"] != archive_sha256:
+        raise ValueError("training archive hash mismatch")
+    if config["price_source_url"] != price.source_url:
+        raise ValueError("price source URL mismatch")
+    if config["rate_usd_per_step"] != price.rate_usd_per_step:
+        raise ValueError("price rate mismatch")
 
     if config["endpoint"] != policy.endpoint:
         raise ValueError("endpoint mismatch")
@@ -616,12 +878,8 @@ def _load_bundle(
     ledger_id = _typed_id(config["ledger_id"], LEDGER_ID_PATTERN, label="ledger_id")
 
     expiries = {
-        policy.expires_at_utc: _parse_utc_timestamp(
-            policy.expires_at_utc, label="policy expires_at_utc"
-        ),
-        price.expires_at_utc: _parse_utc_timestamp(
-            price.expires_at_utc, label="price expires_at_utc"
-        ),
+        policy.expires_at_utc: policy_expiry,
+        price.expires_at_utc: price_expiry,
         root_manifest["expires_at_utc"]: root_expiry,
     }
     expires_at_utc = min(expiries, key=expiries.get)  # type: ignore[arg-type]

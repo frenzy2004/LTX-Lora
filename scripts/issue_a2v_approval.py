@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from ltx_lora_pilot.artifacts import (
-    atomic_write_json,
     canonical_json_bytes,
     strict_load_json,
 )
@@ -60,6 +62,30 @@ def _load_policy(path: Path) -> dict[str, object]:
     return value
 
 
+def _exclusive_atomic_write_json(path: Path, value: Any) -> None:
+    content = canonical_json_bytes(value)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary_path = Path(output.name)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError as exc:
+            raise ValueError("execution approval already exists") from exc
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def _issue(
     run_dir: Path,
     bundle_id: str,
@@ -71,8 +97,6 @@ def _issue(
     run_path = Path(run_dir)
     control_dir = run_path / "control"
     approval_path = control_dir / "execution-approval.json"
-    if _is_symlink_or_junction(approval_path) or approval_path.exists():
-        raise ValueError("execution approval already exists")
     policy = _load_policy(control_dir / "standing-authorization.json")
     receipt = issue_execution_receipt(
         policy,
@@ -82,7 +106,7 @@ def _issue(
         issuer_process_id=issuer_process_id,
         now=now,
     )
-    atomic_write_json(approval_path, receipt.to_dict())
+    _exclusive_atomic_write_json(approval_path, receipt.to_dict())
     return receipt
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import copy
 import hashlib
 import importlib.util
 from importlib import import_module
@@ -7,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 from typing import Any
 import urllib.request
 
@@ -14,7 +17,6 @@ import pytest
 
 from ltx_lora_pilot.a2v_bundle import build_root_manifest, compute_bundle_id
 from ltx_lora_pilot.artifacts import (
-    FileDigest,
     atomic_write_json,
     canonical_json_bytes,
     sha256_file,
@@ -34,6 +36,10 @@ ROOT = Path(__file__).resolve().parents[1]
 RECORD_SCRIPT = ROOT / "scripts" / "record_standing_authorization.py"
 PRICE_SCRIPT = ROOT / "scripts" / "capture_fal_price.py"
 ISSUE_SCRIPT = ROOT / "scripts" / "issue_a2v_approval.py"
+DATASET_MANIFEST = {"schema_version": "synthetic-dataset-v1"}
+ARCHIVE_CONTENT = b"synthetic deterministic archive"
+SYNTHETIC_REPORT = {"schema_version": "synthetic-report-v1"}
+SYNTHETIC_SELECTION = {"schema_version": "synthetic-selection-v1"}
 
 
 def _api() -> Any:
@@ -105,25 +111,81 @@ def _holdout_groups() -> list[dict[str, Any]]:
     return groups
 
 
-def _arbitrary_digest(label: str) -> FileDigest:
-    content = label.encode("ascii")
-    return FileDigest(
-        name=f"{label}.json",
-        bytes=len(content),
-        sha256=hashlib.sha256(content).hexdigest(),
+def _execution_config(
+    *,
+    policy_value: dict[str, Any] | None = None,
+    price_value: dict[str, Any] | None = None,
+    dataset_content: bytes | None = None,
+    archive_content: bytes = ARCHIVE_CONTENT,
+    **overrides: Any,
+) -> dict[str, Any]:
+    bound_policy = valid_policy() if policy_value is None else policy_value
+    bound_price = valid_price_evidence() if price_value is None else price_value
+    bound_dataset = (
+        canonical_json_bytes(DATASET_MANIFEST)
+        if dataset_content is None
+        else dataset_content
     )
-
-
-def _execution_config(**overrides: Any) -> dict[str, Any]:
     value = {
+        "schema_version": "a2v-execution-config-v1",
+        "canonical_json_version": 1,
         "execution_id": EXECUTION_ID,
+        "pilot_id": PILOT_ID,
+        "ledger_id": LEDGER_ID,
+        "created_at_utc": "2026-07-15T01:30:00Z",
+        "expires_at_utc": "2026-07-15T20:00:00Z",
         "endpoint": ENDPOINT,
+        "trigger_phrase": "chrx9_speech",
+        "rank": 32,
         "steps": 1_000,
+        "learning_rate": "0.0002",
+        "training_frames": 89,
+        "training_fps": 24,
+        "resolution": "high",
+        "aspect_ratio": "9:16",
+        "auto_scale_input": False,
+        "split_input_into_scenes": False,
+        "audio_normalize": True,
+        "audio_preserve_pitch": True,
+        "debug_dataset": False,
+        "negative_prompt": "synthetic artifacts, distortion",
+        "validation": [
+            {
+                "image_filename": "validation_01_start.png",
+                "image_sha256": hashlib.sha256(b"validation-image-1").hexdigest(),
+                "audio_filename": "validation_01_audio.wav",
+                "audio_sha256": hashlib.sha256(b"validation-audio-1").hexdigest(),
+                "prompt": "chrx9_speech speaks in a synthetic test scene",
+                "frames": 89,
+                "fps": 24,
+                "resolution": "high",
+                "aspect_ratio": "9:16",
+            },
+            {
+                "image_filename": "validation_02_start.png",
+                "image_sha256": hashlib.sha256(b"validation-image-2").hexdigest(),
+                "audio_filename": "validation_02_audio.wav",
+                "audio_sha256": hashlib.sha256(b"validation-audio-2").hexdigest(),
+                "prompt": "chrx9_speech speaks in another synthetic test scene",
+                "frames": 89,
+                "fps": 24,
+                "resolution": "high",
+                "aspect_ratio": "9:16",
+            },
+        ],
+        "dataset_manifest_sha256": hashlib.sha256(bound_dataset).hexdigest(),
+        "training_archive_sha256": hashlib.sha256(archive_content).hexdigest(),
+        "standing_authorization_sha256": hashlib.sha256(
+            canonical_json_bytes(bound_policy)
+        ).hexdigest(),
+        "price_evidence_sha256": hashlib.sha256(
+            canonical_json_bytes(bound_price)
+        ).hexdigest(),
+        "price_source_url": OFFICIAL_PRICE_URL,
+        "rate_usd_per_step": "0.006",
         "training_max_usd": "6.0000",
         "validation_allocation_usd": "1.2500",
         "cumulative_cap_usd": "12.0000",
-        "pilot_id": PILOT_ID,
-        "ledger_id": LEDGER_ID,
     }
     value.update(overrides)
     return value
@@ -138,53 +200,73 @@ def _write_bundle(
     config: dict[str, Any] | None = None,
     root_execution_id: str | None = None,
     plan_content: bytes = b"synthetic approved plan",
-    root_expires_at_utc: str = "2026-07-15T20:00:00Z",
+    root_created_at_utc: str | None = None,
+    root_expires_at_utc: str | None = None,
 ) -> tuple[Path, dict[str, Any], str]:
     run_dir = tmp_path / name
     control_dir = run_dir / "control"
     bundle_dir = run_dir / "bundle"
+    validation_dir = run_dir / "validation"
     control_dir.mkdir(parents=True)
     bundle_dir.mkdir()
+    validation_dir.mkdir()
 
     policy_value = valid_policy() if policy is None else policy
     price_value = valid_price_evidence() if price is None else price
-    config_value = _execution_config() if config is None else config
     plan_path = run_dir / "plan.md"
     policy_path = control_dir / "standing-authorization.json"
     price_path = control_dir / "price-evidence.json"
     config_path = control_dir / "execution-config.json"
+    structural_path = control_dir / "structural-report.json"
+    quality_path = control_dir / "quality-attestation.json"
+    selection_path = validation_dir / "provider-validation-selection.json"
     dataset_path = bundle_dir / "dataset-manifest.json"
     archive_path = bundle_dir / "training-data.zip"
 
     plan_path.write_bytes(plan_content)
     atomic_write_json(policy_path, policy_value)
     atomic_write_json(price_path, price_value)
+    atomic_write_json(structural_path, SYNTHETIC_REPORT)
+    atomic_write_json(quality_path, SYNTHETIC_REPORT)
+    atomic_write_json(selection_path, SYNTHETIC_SELECTION)
+    atomic_write_json(dataset_path, DATASET_MANIFEST)
+    archive_path.write_bytes(ARCHIVE_CONTENT)
+    if config is None:
+        timestamp_overrides = {}
+        if root_created_at_utc is not None:
+            timestamp_overrides["created_at_utc"] = root_created_at_utc
+        if root_expires_at_utc is not None:
+            timestamp_overrides["expires_at_utc"] = root_expires_at_utc
+        config_value = _execution_config(
+            policy_value=policy_value,
+            price_value=price_value,
+            dataset_content=dataset_path.read_bytes(),
+            archive_content=archive_path.read_bytes(),
+            **timestamp_overrides,
+        )
+    else:
+        config_value = config
     atomic_write_json(config_path, config_value)
-    atomic_write_json(dataset_path, {"schema_version": "synthetic-dataset-v1"})
-    archive_path.write_bytes(b"synthetic deterministic archive")
 
     artifacts = {
-        role: _arbitrary_digest(role)
-        for role in {
-            "structural_report",
-            "quality_attestation",
-            "provider_validation_selection",
-        }
+        "plan": sha256_file(plan_path),
+        "standing_authorization": sha256_file(policy_path),
+        "price_evidence": sha256_file(price_path),
+        "structural_report": sha256_file(structural_path),
+        "quality_attestation": sha256_file(quality_path),
+        "provider_validation_selection": sha256_file(selection_path),
+        "execution_config": sha256_file(config_path),
+        "dataset_manifest": sha256_file(dataset_path),
+        "training_archive": sha256_file(archive_path),
     }
-    artifacts.update(
-        {
-            "plan": sha256_file(plan_path),
-            "standing_authorization": sha256_file(policy_path),
-            "price_evidence": sha256_file(price_path),
-            "execution_config": sha256_file(config_path),
-            "dataset_manifest": sha256_file(dataset_path),
-            "training_archive": sha256_file(archive_path),
-        }
-    )
     root_manifest = build_root_manifest(
         execution_id=root_execution_id or config_value["execution_id"],
-        created_at_utc="2026-07-15T01:30:00Z",
-        expires_at_utc=root_expires_at_utc,
+        created_at_utc=(
+            root_created_at_utc or config_value["created_at_utc"]
+        ),
+        expires_at_utc=(
+            root_expires_at_utc or config_value["expires_at_utc"]
+        ),
         repository_commit="f" * 40,
         artifacts=artifacts,
         holdout_groups=_holdout_groups(),
@@ -378,6 +460,411 @@ def test_issuer_rejects_execution_config_mismatch(
         )
 
 
+@pytest.mark.parametrize("mutation", ["unknown", "missing"])
+def test_issuer_requires_exact_versioned_execution_config_schema(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    config = _execution_config()
+    if mutation == "unknown":
+        config["steps_override"] = 2_000
+    else:
+        del config["negative_prompt"]
+    run_dir, _, bundle_id = _write_bundle(tmp_path, config=config)
+
+    with pytest.raises(ValueError, match="execution configuration.*exact fields"):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "created_at_utc",
+            "2026-07-15T01:30:00+00:00",
+            "created_at_utc must be a canonical UTC timestamp",
+        ),
+        (
+            "created_at_utc",
+            True,
+            "created_at_utc must be a canonical UTC timestamp",
+        ),
+        (
+            "expires_at_utc",
+            "2026-07-15T20:00:00+00:00",
+            "expires_at_utc must be a canonical UTC timestamp",
+        ),
+        (
+            "expires_at_utc",
+            "2026-07-15T01:30:00Z",
+            "expires_at_utc must be after created_at_utc",
+        ),
+    ],
+)
+def test_issuer_rejects_noncanonical_or_reversed_config_timestamps(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+    message: str,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(
+        tmp_path,
+        config=_execution_config(**{field: value}),
+        root_created_at_utc="2026-07-15T01:30:00Z",
+        root_expires_at_utc="2026-07-15T20:00:00Z",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    ("root_field", "value", "message"),
+    [
+        (
+            "root_created_at_utc",
+            "2026-07-15T01:31:00Z",
+            "execution configuration creation timestamp mismatch",
+        ),
+        (
+            "root_expires_at_utc",
+            "2026-07-15T19:59:59Z",
+            "execution configuration expiry timestamp mismatch",
+        ),
+    ],
+)
+def test_issuer_requires_config_timestamps_to_equal_root_manifest(
+    tmp_path: Path,
+    root_field: str,
+    value: str,
+    message: str,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(
+        tmp_path,
+        config=_execution_config(),
+        **{root_field: value},
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+def test_builder_compatible_config_timestamps_are_root_bound(
+    tmp_path: Path,
+) -> None:
+    run_dir, root_manifest, bundle_id = _write_bundle(tmp_path)
+    config = json.loads(
+        (run_dir / "control" / "execution-config.json").read_text("utf-8")
+    )
+
+    assert len(config) == 32
+    assert set(config) == _api().EXECUTION_CONFIG_FIELDS
+    assert config["created_at_utc"] == root_manifest["created_at_utc"]
+    assert config["expires_at_utc"] == root_manifest["expires_at_utc"]
+    receipt = _api().issue_execution_receipt(
+        valid_policy(),
+        run_dir,
+        expected_bundle_id=bundle_id,
+        approval_id=APPROVAL_ID,
+        issuer_process_id=ISSUER_PROCESS_ID,
+        now=FIXED_TIME,
+    )
+    assert receipt.expires_at_utc == config["expires_at_utc"]
+
+
+def test_issuer_rejects_bundle_expiry_beyond_standing_authorization(
+    tmp_path: Path,
+) -> None:
+    policy = valid_policy(expires_at_utc="2026-07-15T19:59:59Z")
+    config = _execution_config(policy_value=policy)
+    run_dir, _, bundle_id = _write_bundle(
+        tmp_path,
+        policy=policy,
+        config=config,
+    )
+
+    with pytest.raises(ValueError, match="bundle expiry exceeds policy expiry"):
+        _api().issue_execution_receipt(
+            policy,
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+def test_issuer_rejects_bundle_expiry_beyond_price_evidence(
+    tmp_path: Path,
+) -> None:
+    price = valid_price_evidence(expires_at_utc="2026-07-15T19:59:59Z")
+    config = _execution_config(price_value=price)
+    run_dir, _, bundle_id = _write_bundle(
+        tmp_path,
+        price=price,
+        config=config,
+    )
+
+    with pytest.raises(ValueError, match="bundle expiry exceeds price evidence expiry"):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("schema_version", "a2v-execution-config-v2", "schema mismatch"),
+        (
+            "canonical_json_version",
+            2,
+            "canonical JSON version mismatch",
+        ),
+        (
+            "canonical_json_version",
+            True,
+            "canonical JSON version mismatch",
+        ),
+        ("rank", 16, "rank mismatch"),
+        ("rank", True, "rank mismatch"),
+        ("learning_rate", "0.00020", "learning rate mismatch"),
+        ("learning_rate", 0, "learning rate mismatch"),
+        ("training_frames", 88, "training frames mismatch"),
+        ("training_fps", 25, "training fps mismatch"),
+        ("resolution", "low", "resolution mismatch"),
+        ("aspect_ratio", "16:9", "aspect ratio mismatch"),
+        ("auto_scale_input", True, "auto-scale mismatch"),
+        ("split_input_into_scenes", True, "split-scenes mismatch"),
+        ("audio_normalize", False, "audio normalization mismatch"),
+        ("audio_preserve_pitch", False, "pitch preservation mismatch"),
+        ("debug_dataset", True, "debug_dataset must be false"),
+        ("trigger_phrase", "Human Name", "neutral trigger phrase"),
+    ],
+)
+def test_issuer_rejects_non_fixed_a2v_request_values(
+    tmp_path: Path,
+    field: str,
+    value: Any,
+    message: str,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(
+        tmp_path,
+        config=_execution_config(**{field: value}),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("count", "exactly two validation entries"),
+        ("unknown", "validation entry.*exact fields"),
+        ("missing", "validation entry.*exact fields"),
+        ("frames", "validation frames mismatch"),
+        ("fps_bool", "validation fps mismatch"),
+        ("resolution", "validation resolution mismatch"),
+        ("aspect", "validation aspect ratio mismatch"),
+        ("filename", "canonical local filename"),
+        ("hash", "image_sha256 must be a lowercase SHA-256"),
+        ("prompt", "canonical non-empty text"),
+        ("order", "canonical validation order"),
+    ],
+)
+def test_issuer_rejects_malformed_nested_validation_entries(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    config = _execution_config()
+    validation = copy.deepcopy(config["validation"])
+    if mutation == "count":
+        validation.pop()
+    elif mutation == "unknown":
+        validation[0]["image_url"] = "https://example.invalid/private"
+    elif mutation == "missing":
+        del validation[0]["prompt"]
+    elif mutation == "frames":
+        validation[0]["frames"] = 88
+    elif mutation == "fps_bool":
+        validation[0]["fps"] = True
+    elif mutation == "resolution":
+        validation[0]["resolution"] = "low"
+    elif mutation == "aspect":
+        validation[0]["aspect_ratio"] = "16:9"
+    elif mutation == "filename":
+        validation[0]["image_filename"] = "../private.png"
+    elif mutation == "hash":
+        validation[0]["image_sha256"] = "A" * 64
+    elif mutation == "prompt":
+        validation[0]["prompt"] = " trailing space "
+    else:
+        validation.reverse()
+    config["validation"] = validation
+    run_dir, _, bundle_id = _write_bundle(tmp_path, config=config)
+
+    with pytest.raises(ValueError, match=message):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("dataset_manifest_sha256", "0" * 64, "dataset manifest hash mismatch"),
+        ("training_archive_sha256", "0" * 64, "training archive hash mismatch"),
+        (
+            "standing_authorization_sha256",
+            "0" * 64,
+            "standing authorization config hash mismatch",
+        ),
+        ("price_evidence_sha256", "0" * 64, "price evidence config hash mismatch"),
+        ("price_source_url", "https://example.invalid", "price source URL mismatch"),
+        ("rate_usd_per_step", "0.007", "price rate mismatch"),
+    ],
+)
+def test_issuer_rejects_execution_config_binding_changes(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(
+        tmp_path,
+        config=_execution_config(**{field: value}),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "plan.md",
+        "control/standing-authorization.json",
+        "control/price-evidence.json",
+        "control/structural-report.json",
+        "control/quality-attestation.json",
+        "control/execution-config.json",
+        "validation/provider-validation-selection.json",
+        "bundle/dataset-manifest.json",
+        "bundle/training-data.zip",
+    ],
+)
+def test_issuer_requires_every_root_bound_file(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(tmp_path)
+    (run_dir / relative_path).unlink()
+
+    with pytest.raises(ValueError, match="private bundle input is unavailable"):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "message"),
+    [
+        ("control/structural-report.json", "structural report root binding mismatch"),
+        ("control/quality-attestation.json", "quality attestation root binding mismatch"),
+        (
+            "validation/provider-validation-selection.json",
+            "provider validation selection root binding mismatch",
+        ),
+    ],
+)
+def test_issuer_freshly_hashes_previously_unchecked_root_artifacts(
+    tmp_path: Path,
+    relative_path: str,
+    message: str,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(tmp_path)
+    atomic_write_json(run_dir / relative_path, {"tampered": True})
+
+    with pytest.raises(ValueError, match=message):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+def test_issuer_rejects_aliasing_root_bound_files(tmp_path: Path) -> None:
+    run_dir, _, bundle_id = _write_bundle(tmp_path)
+    structural_path = run_dir / "control" / "structural-report.json"
+    quality_path = run_dir / "control" / "quality-attestation.json"
+    quality_path.unlink()
+    os.link(structural_path, quality_path)
+
+    with pytest.raises(ValueError, match="root-bound files must not alias"):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
 def test_issuer_rejects_expired_bundle_wrong_policy_hash_and_replay_id(
     tmp_path: Path,
 ) -> None:
@@ -475,7 +962,7 @@ def test_receipt_hashes_are_the_exact_bound_artifacts(tmp_path: Path) -> None:
 
 
 def test_price_capture_binds_official_url_formula_hash_and_24_hour_expiry() -> None:
-    response = b"Training costs $0.006 * steps; 1,000 steps cost $6.00."
+    response = b"Training costs 0.006 * steps; 1000 steps cost $6.00."
     requested_urls: list[str] = []
 
     def fetch(url: str) -> bytes:
@@ -501,25 +988,49 @@ def test_price_capture_requires_official_formula() -> None:
         _api().capture_price_evidence(fetch=fetch, now=FIXED_TIME)
 
 
+def test_price_capture_isolates_a2v_and_accepts_identical_live_duplicates() -> None:
+    response = (
+        b'<section data-model="fal-ai/other">$0.007 * steps; '
+        b'1000 steps cost $7.00.</section>'
+        b'<section data-model="fal-ai/ltx23-trainer-v2/a2v">0.006 * steps; '
+        b'1000 steps cost $6.00.</section>'
+        b'<section data-model="fal-ai/other-after">$0.009 * steps; '
+        b'1000 steps cost $9.00.</section>'
+        b'<script>{"endpoint":"fal-ai/ltx23-trainer-v2/a2v",'
+        b'"formula":"0.006 * steps","example":"1000 steps costs $6.00"}'
+        b"</script>"
+    )
+
+    evidence = _api().capture_price_evidence(
+        fetch=lambda _url: response,
+        now=FIXED_TIME,
+    )
+
+    assert evidence.rate_usd_per_step == "0.006"
+    assert evidence.response_sha256 == hashlib.sha256(response).hexdigest()
+
+
+def test_price_capture_rejects_conflicting_a2v_anchored_serializations() -> None:
+    response = (
+        b'<section data-model="fal-ai/ltx23-trainer-v2/a2v">0.006 * steps; '
+        b'1000 steps cost $6.00.</section>'
+        b'<section data-model="fal-ai/ltx23-trainer-v2/a2v">0.007 * steps; '
+        b'1000 steps cost $7.00.</section>'
+    )
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
 @pytest.mark.parametrize(
     ("response", "message"),
     [
-        (
-            b"Training costs 0.006 * steps; 1,000 steps cost $6.00.",
-            "unexpected A2V rate",
-        ),
-        (
-            b"$0.006 * steps; $0.006 * steps; 1,000 steps cost $6.00.",
-            "unexpected A2V rate",
-        ),
         (b"Training costs $0.006 * steps.", "unexpected 1,000-step cost"),
         (
             b"Training costs $0.006 * steps; 1,000 steps cost $7.00.",
-            "unexpected 1,000-step cost",
-        ),
-        (
-            b"Training costs $0.006 * steps; 1,000 steps cost $6.00; "
-            b"1,000 steps cost $6.00.",
             "unexpected 1,000-step cost",
         ),
     ],
@@ -648,7 +1159,7 @@ def test_default_price_fetch_is_bounded_unauthenticated_and_redirect_limited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     response_body = b"Training costs $0.006 * steps; 1,000 steps cost $6.00."
-    opened: dict[str, Any] = {}
+    opened: dict[str, Any] = {"handlers": []}
 
     class FakeResponse:
         status = 200
@@ -672,11 +1183,13 @@ def test_default_price_fetch_is_bounded_unauthenticated_and_redirect_limited(
             opened["timeout"] = timeout
             return FakeResponse()
 
-    monkeypatch.setattr(
-        _api().urllib_request,
-        "build_opener",
-        lambda *_handlers: FakeOpener(),
-    )
+    def build_opener(*handlers: Any) -> FakeOpener:
+        opened["handlers"].extend(handlers)
+        return FakeOpener()
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setattr(_api().urllib_request, "build_opener", build_opener)
 
     assert _api()._fetch_official_price(OFFICIAL_PRICE_URL) == response_body
     request = opened["request"]
@@ -684,9 +1197,17 @@ def test_default_price_fetch_is_bounded_unauthenticated_and_redirect_limited(
     assert request.full_url == OFFICIAL_PRICE_URL
     assert request.get_method() == "GET"
     assert "authorization" not in headers
+    assert "proxy-authorization" not in headers
     assert "cookie" not in headers
     assert opened["timeout"] == 10
     assert opened["read_size"] == 1_048_577
+    proxy_handlers = [
+        handler
+        for handler in opened["handlers"]
+        if isinstance(handler, urllib.request.ProxyHandler)
+    ]
+    assert len(proxy_handlers) == 1
+    assert proxy_handlers[0].proxies == {}
 
     handler = _api()._OfficialPriceRedirectHandler()
     with pytest.raises(ValueError, match="redirect left"):
@@ -866,6 +1387,61 @@ def test_issuer_writes_once_and_has_no_paid_capabilities(
         "submit",
     ):
         assert prohibited not in issuer_source
+
+
+def test_concurrent_issuers_publish_exactly_one_complete_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir, _, bundle_id = _write_bundle(tmp_path)
+    issuer = _load_script(ISSUE_SCRIPT)
+    original_issue = issuer.issue_execution_receipt
+    publication_barrier = threading.Barrier(2)
+
+    def synchronized_issue(*args: Any, **kwargs: Any) -> Any:
+        receipt = original_issue(*args, **kwargs)
+        publication_barrier.wait(timeout=10)
+        return receipt
+
+    monkeypatch.setattr(issuer, "issue_execution_receipt", synchronized_issue)
+    identifiers = [
+        (
+            "approval_00000000000040008000000000000007",
+            "process_00000000000040008000000000000009",
+        ),
+        (
+            "approval_00000000000040008000000000000008",
+            "process_0000000000004000800000000000000a",
+        ),
+    ]
+
+    def attempt(approval_id: str, process_id: str) -> Any:
+        try:
+            return issuer._issue(
+                run_dir,
+                bundle_id,
+                approval_id=approval_id,
+                issuer_process_id=process_id,
+                now=FIXED_TIME,
+            )
+        except Exception as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda pair: attempt(*pair), identifiers))
+
+    receipts = [result for result in results if isinstance(result, _api().ExecutionReceipt)]
+    failures = [result for result in results if isinstance(result, Exception)]
+    assert len(receipts) == 1
+    assert len(failures) == 1
+    assert str(failures[0]) == "execution approval already exists"
+
+    approval_path = run_dir / "control" / "execution-approval.json"
+    serialized = approval_path.read_bytes()
+    published = json.loads(serialized)
+    assert serialized == canonical_json_bytes(published)
+    assert published == receipts[0].to_dict()
+    assert not list(approval_path.parent.glob(".execution-approval.json.*.tmp"))
 
 
 def test_issuer_cli_requires_full_bundle_id_and_neutral_output(
