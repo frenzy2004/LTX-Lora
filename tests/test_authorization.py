@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-import copy
 from dataclasses import replace
 import hashlib
 import importlib.util
@@ -162,7 +161,7 @@ def _execution_config(
         else dataset_content
     )
     value = {
-        "schema_version": "a2v-execution-config-v1",
+        "schema_version": "a2v-execution-config-v2",
         "canonical_json_version": 1,
         "execution_id": EXECUTION_ID,
         "pilot_id": PILOT_ID,
@@ -184,30 +183,10 @@ def _execution_config(
         "audio_preserve_pitch": True,
         "debug_dataset": False,
         "negative_prompt": "synthetic artifacts, distortion",
-        "validation": [
-            {
-                "image_filename": "validation_01_start.png",
-                "image_sha256": hashlib.sha256(b"validation-image-1").hexdigest(),
-                "audio_filename": "validation_01_audio.wav",
-                "audio_sha256": hashlib.sha256(b"validation-audio-1").hexdigest(),
-                "prompt": "chrx9_speech speaks in a synthetic test scene",
-                "frames": 89,
-                "fps": 24,
-                "resolution": "high",
-                "aspect_ratio": "9:16",
-            },
-            {
-                "image_filename": "validation_02_start.png",
-                "image_sha256": hashlib.sha256(b"validation-image-2").hexdigest(),
-                "audio_filename": "validation_02_audio.wav",
-                "audio_sha256": hashlib.sha256(b"validation-audio-2").hexdigest(),
-                "prompt": "chrx9_speech speaks in another synthetic test scene",
-                "frames": 89,
-                "fps": 24,
-                "resolution": "high",
-                "aspect_ratio": "9:16",
-            },
-        ],
+        "validation_number_of_frames": 89,
+        "validation_frame_rate": 24,
+        "validation_resolution": "high",
+        "validation_aspect_ratio": "9:16",
         "dataset_manifest_sha256": hashlib.sha256(bound_dataset).hexdigest(),
         "training_archive_sha256": hashlib.sha256(archive_content).hexdigest(),
         "standing_authorization_sha256": hashlib.sha256(
@@ -842,7 +821,7 @@ def test_builder_compatible_config_timestamps_are_root_bound(
         (run_dir / "control" / "execution-config.json").read_text("utf-8")
     )
 
-    assert len(config) == 32
+    assert len(config) == 35
     assert set(config) == _api().EXECUTION_CONFIG_FIELDS
     assert config["created_at_utc"] == root_manifest["created_at_utc"]
     assert config["expires_at_utc"] == root_manifest["expires_at_utc"]
@@ -855,6 +834,17 @@ def test_builder_compatible_config_timestamps_are_root_bound(
         now=FIXED_TIME,
     )
     assert receipt.expires_at_utc == config["expires_at_utc"]
+
+
+def test_public_execution_config_validator_is_exact_and_defensive() -> None:
+    config = _execution_config()
+
+    validated = _api().validate_execution_config(config)
+
+    assert validated == config
+    assert validated is not config
+    validated["endpoint"] = "changed-after-validation"
+    assert config["endpoint"] == ENDPOINT
 
 
 def test_issuer_rejects_bundle_expiry_beyond_standing_authorization(
@@ -904,7 +894,7 @@ def test_issuer_rejects_bundle_expiry_beyond_price_evidence(
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("schema_version", "a2v-execution-config-v2", "schema mismatch"),
+        ("schema_version", "a2v-execution-config-v1", "schema mismatch"),
         (
             "canonical_json_version",
             2,
@@ -923,6 +913,20 @@ def test_issuer_rejects_bundle_expiry_beyond_price_evidence(
         ("training_fps", 25, "training fps mismatch"),
         ("resolution", "low", "resolution mismatch"),
         ("aspect_ratio", "16:9", "aspect ratio mismatch"),
+        (
+            "validation_number_of_frames",
+            88,
+            "validation number of frames mismatch",
+        ),
+        (
+            "validation_number_of_frames",
+            True,
+            "validation number of frames mismatch",
+        ),
+        ("validation_frame_rate", 25, "validation frame rate mismatch"),
+        ("validation_frame_rate", True, "validation frame rate mismatch"),
+        ("validation_resolution", "medium", "validation resolution mismatch"),
+        ("validation_aspect_ratio", "16:9", "validation aspect ratio mismatch"),
         ("auto_scale_input", True, "auto-scale mismatch"),
         ("split_input_into_scenes", True, "split-scenes mismatch"),
         ("audio_normalize", False, "audio normalization mismatch"),
@@ -953,94 +957,20 @@ def test_issuer_rejects_non_fixed_a2v_request_values(
         )
 
 
-@pytest.mark.parametrize(
-    ("mutation", "message"),
-    [
-        ("count", "exactly two validation entries"),
-        ("unknown", "validation entry.*exact fields"),
-        ("missing", "validation entry.*exact fields"),
-        ("frames", "validation frames mismatch"),
-        ("fps_bool", "validation fps mismatch"),
-        ("resolution", "validation resolution mismatch"),
-        ("aspect", "validation aspect ratio mismatch"),
-        ("filename", "canonical local filename"),
-        ("hash", "image_sha256 must be a lowercase SHA-256"),
-        ("prompt", "canonical non-empty text"),
-        ("order", "canonical validation order"),
-    ],
-)
-def test_issuer_rejects_malformed_nested_validation_entries(
+def test_issuer_rejects_embedded_provider_validation_items(
     tmp_path: Path,
-    mutation: str,
-    message: str,
 ) -> None:
     config = _execution_config()
-    validation = copy.deepcopy(config["validation"])
-    if mutation == "count":
-        validation.pop()
-    elif mutation == "unknown":
-        validation[0]["image_url"] = "https://example.invalid/private"
-    elif mutation == "missing":
-        del validation[0]["prompt"]
-    elif mutation == "frames":
-        validation[0]["frames"] = 88
-    elif mutation == "fps_bool":
-        validation[0]["fps"] = True
-    elif mutation == "resolution":
-        validation[0]["resolution"] = "low"
-    elif mutation == "aspect":
-        validation[0]["aspect_ratio"] = "16:9"
-    elif mutation == "filename":
-        validation[0]["image_filename"] = "../private.png"
-    elif mutation == "hash":
-        validation[0]["image_sha256"] = "A" * 64
-    elif mutation == "prompt":
-        validation[0]["prompt"] = " trailing space "
-    else:
-        validation.reverse()
-    config["validation"] = validation
+    config["validation"] = [
+        {
+            "prompt": "must live in the immutable selection",
+            "image_url": "https://example.invalid/private",
+            "audio_url": "https://example.invalid/private",
+        }
+    ]
     run_dir, _, bundle_id = _write_bundle(tmp_path, config=config)
 
-    with pytest.raises(ValueError, match=message):
-        _api().issue_execution_receipt(
-            valid_policy(),
-            run_dir,
-            expected_bundle_id=bundle_id,
-            approval_id=APPROVAL_ID,
-            issuer_process_id=ISSUER_PROCESS_ID,
-            now=FIXED_TIME,
-        )
-
-
-@pytest.mark.parametrize(
-    ("field", "suffix", "message"),
-    [
-        (
-            "image_filename",
-            ".png",
-            "validation image filenames must be case-insensitively unique",
-        ),
-        (
-            "audio_filename",
-            ".wav",
-            "validation audio filenames must be case-insensitively unique",
-        ),
-    ],
-)
-def test_issuer_rejects_casefold_colliding_validation_filenames(
-    tmp_path: Path,
-    field: str,
-    suffix: str,
-    message: str,
-) -> None:
-    config = _execution_config()
-    validation = copy.deepcopy(config["validation"])
-    validation[0][field] = f"Validation{suffix}"
-    validation[1][field] = f"validation{suffix}"
-    config["validation"] = validation
-    run_dir, _, bundle_id = _write_bundle(tmp_path, config=config)
-
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="execution configuration.*exact fields"):
         _api().issue_execution_receipt(
             valid_policy(),
             run_dir,

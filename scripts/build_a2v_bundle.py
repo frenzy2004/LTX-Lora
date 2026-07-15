@@ -20,6 +20,9 @@ from ltx_lora_pilot.artifacts import (
     sha256_file,
     strict_load_json,
 )
+from ltx_lora_pilot.provider_validation import (
+    validate_provider_validation_selection,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -149,11 +152,18 @@ def _build(run_dir: Path) -> dict[str, str]:
     _load_canonical_json(policy_path)
     _load_canonical_json(price_path)
     execution_config = _load_canonical_json(execution_config_path)
-    _load_canonical_json(selection_path)
+    selection = _load_canonical_json(selection_path)
 
     quality_summary = validate_quality_and_splits(
         quality_attestation,
         structural_report,
+    )
+    validate_provider_validation_selection(
+        selection,
+        structural_report,
+        quality_summary,
+        execution_config,
+        candidate_dir,
     )
     groups = _resolved_groups(structural_report, quality_summary, candidate_dir)
     archive_path = bundle_dir / "training-data.zip"

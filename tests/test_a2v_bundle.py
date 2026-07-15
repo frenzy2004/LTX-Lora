@@ -22,8 +22,9 @@ from ltx_lora_pilot.a2v_bundle import (
     compute_bundle_id,
     inspect_training_archive,
 )
-from ltx_lora_pilot.a2v_quality import CHECK_KEYS
+from ltx_lora_pilot.a2v_quality import CHECK_KEYS, validate_quality_and_splits
 from ltx_lora_pilot.artifacts import FileDigest, canonical_json_bytes
+from ltx_lora_pilot.provider_validation import build_provider_validation_selection
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +44,8 @@ REQUIRED_ROOT_ARTIFACTS = {
 }
 DATASET_ID = "dset_0123456789ab4def8123456789abcdef"
 EXECUTION_ID = "exec_fedcba9876544321a0fedcba98765432"
+PILOT_ID = "pilot_00000000000040008000000000000001"
+LEDGER_ID = "ledger_00000000000040008000000000000002"
 
 
 def _machine_group_id(index: int) -> str:
@@ -249,6 +252,79 @@ def _valid_root_manifest() -> dict[str, Any]:
         artifacts=artifacts,
         holdout_groups=dataset["groups"]["holdout"],
     )
+
+
+def _write_build_command_inputs(
+    tmp_path: Path,
+) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    run_dir = tmp_path / "private-run"
+    candidates = run_dir / "candidates"
+    control = run_dir / "control"
+    validation = run_dir / "validation"
+    candidates.mkdir(parents=True)
+    control.mkdir()
+    validation.mkdir()
+    structural, attestation = _reports(candidate_root=candidates)
+    execution_config = {
+        "schema_version": "a2v-execution-config-v2",
+        "canonical_json_version": 1,
+        "execution_id": EXECUTION_ID,
+        "pilot_id": PILOT_ID,
+        "ledger_id": LEDGER_ID,
+        "created_at_utc": "2026-07-15T01:00:00Z",
+        "expires_at_utc": "2026-07-16T01:00:00Z",
+        "endpoint": "fal-ai/ltx23-trainer-v2/a2v",
+        "trigger_phrase": "chrx9_speech",
+        "rank": 32,
+        "steps": 1_000,
+        "learning_rate": "0.0002",
+        "training_frames": 89,
+        "training_fps": 24,
+        "resolution": "high",
+        "aspect_ratio": "9:16",
+        "auto_scale_input": False,
+        "split_input_into_scenes": False,
+        "audio_normalize": True,
+        "audio_preserve_pitch": True,
+        "debug_dataset": False,
+        "negative_prompt": "synthetic artifacts, distortion",
+        "validation_number_of_frames": 89,
+        "validation_frame_rate": 24,
+        "validation_resolution": "high",
+        "validation_aspect_ratio": "9:16",
+        "dataset_manifest_sha256": "1" * 64,
+        "training_archive_sha256": "2" * 64,
+        "standing_authorization_sha256": "3" * 64,
+        "price_evidence_sha256": "4" * 64,
+        "price_source_url": "https://fal.ai/models/fal-ai/ltx23-trainer-v2/a2v",
+        "rate_usd_per_step": "0.006",
+        "training_max_usd": "6.0000",
+        "validation_allocation_usd": "1.2500",
+        "cumulative_cap_usd": "12.0000",
+    }
+    quality_summary = validate_quality_and_splits(attestation, structural)
+    selection = build_provider_validation_selection(
+        structural_report=structural,
+        quality_summary=quality_summary,
+        execution_config=execution_config,
+        candidate_dir=candidates,
+        prompts={
+            _machine_group_id(11): "A medium talking-head shot with natural speech and steady eye contact.",
+            _machine_group_id(12): "A close talking-head shot with natural speech and subtle facial motion.",
+        },
+    )
+    (run_dir / "plan.md").write_text("private approved plan", encoding="utf-8")
+    inputs = {
+        control / "structural-report.json": structural,
+        control / "quality-attestation.json": attestation,
+        control / "standing-authorization.json": {"policy_id": "policy-001"},
+        control / "price-evidence.json": {"rate_usd_per_step": "0.006"},
+        control / "execution-config.json": execution_config,
+        validation / "provider-validation-selection.json": selection,
+    }
+    for path, value in inputs.items():
+        path.write_bytes(canonical_json_bytes(value))
+    return run_dir, structural, attestation, execution_config, selection
 
 
 def test_archive_is_byte_identical_across_two_builds(tmp_path: Path) -> None:
@@ -885,31 +961,7 @@ def test_bundle_id_excludes_self_hash() -> None:
 def test_build_command_writes_only_content_addressed_bundle_outputs(
     tmp_path: Path,
 ) -> None:
-    run_dir = tmp_path / "private-run"
-    candidates = run_dir / "candidates"
-    control = run_dir / "control"
-    validation = run_dir / "validation"
-    candidates.mkdir(parents=True)
-    control.mkdir()
-    validation.mkdir()
-    structural, attestation = _reports(candidate_root=candidates)
-    (run_dir / "plan.md").write_text("private approved plan", encoding="utf-8")
-    inputs = {
-        control / "structural-report.json": structural,
-        control / "quality-attestation.json": attestation,
-        control / "standing-authorization.json": {"policy_id": "policy-001"},
-        control / "price-evidence.json": {"rate_usd_per_step": "0.006"},
-        control / "execution-config.json": {
-            "execution_id": EXECUTION_ID,
-            "created_at_utc": "2026-07-15T01:00:00Z",
-            "expires_at_utc": "2026-07-16T01:00:00Z",
-        },
-        validation / "provider-validation-selection.json": {
-            "group_ids": [_machine_group_id(11), _machine_group_id(12)]
-        },
-    }
-    for path, value in inputs.items():
-        path.write_bytes(canonical_json_bytes(value))
+    run_dir, structural, _, _, _ = _write_build_command_inputs(tmp_path)
 
     completed = subprocess.run(
         [sys.executable, str(BUILD_SCRIPT), str(run_dir)],
@@ -943,6 +995,95 @@ def test_build_command_writes_only_content_addressed_bundle_outputs(
             for record in group["files"]
         }
         assert set(archive.namelist()) == expected_names
+
+
+def test_build_command_rejects_selection_stale_against_current_execution_config(
+    tmp_path: Path,
+) -> None:
+    run_dir, _, _, execution_config, _ = _write_build_command_inputs(tmp_path)
+    execution_config["validation_frame_rate"] = 25
+    (run_dir / "control" / "execution-config.json").write_bytes(
+        canonical_json_bytes(execution_config)
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(BUILD_SCRIPT), str(run_dir)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "A2V_BUNDLE_BUILD_FAILED\n"
+    assert not (run_dir / "bundle" / "bundle-manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "unknown", "endpoint", "resolution", "validation_frames"],
+)
+def test_build_command_rejects_digest_consistent_malformed_execution_config(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    run_dir, _, _, execution_config, selection = _write_build_command_inputs(
+        tmp_path
+    )
+    if mutation == "missing":
+        del execution_config["rank"]
+    elif mutation == "unknown":
+        execution_config["validation"] = []
+    elif mutation == "endpoint":
+        execution_config["endpoint"] = "fal-ai/ltx23-trainer-v2/i2v"
+    elif mutation == "resolution":
+        execution_config["resolution"] = "low"
+    else:
+        execution_config["validation_number_of_frames"] = 88
+    selection["execution_config_sha256"] = hashlib.sha256(
+        canonical_json_bytes(execution_config)
+    ).hexdigest()
+    (run_dir / "control" / "execution-config.json").write_bytes(
+        canonical_json_bytes(execution_config)
+    )
+    (run_dir / "validation" / "provider-validation-selection.json").write_bytes(
+        canonical_json_bytes(selection)
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(BUILD_SCRIPT), str(run_dir)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "A2V_BUNDLE_BUILD_FAILED\n"
+    assert not (run_dir / "bundle" / "bundle-manifest.json").exists()
+
+
+def test_build_command_rejects_selection_of_training_group(tmp_path: Path) -> None:
+    run_dir, _, _, _, selection = _write_build_command_inputs(tmp_path)
+    selection["items"][0]["group_id"] = _machine_group_id(1)
+    (run_dir / "validation" / "provider-validation-selection.json").write_bytes(
+        canonical_json_bytes(selection)
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(BUILD_SCRIPT), str(run_dir)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "A2V_BUNDLE_BUILD_FAILED\n"
+    assert not (run_dir / "bundle" / "bundle-manifest.json").exists()
 
 
 def test_build_command_sanitizes_parse_and_runtime_failures(tmp_path: Path) -> None:

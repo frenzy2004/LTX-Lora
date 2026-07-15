@@ -15,7 +15,6 @@ from urllib import request as urllib_request
 from .a2v_bundle import compute_bundle_id
 from .artifacts import (
     canonical_json_bytes,
-    safe_relative_name,
     sha256_file,
     strict_load_json,
 )
@@ -33,7 +32,7 @@ CUMULATIVE_CAP_USD = "12.0000"
 APPROVAL_SCHEMA_VERSION = "a2v-execution-approval-v2"
 APPROVAL_STATUS = "approved_for_paid_execution"
 APPROVAL_MODE = "standing_policy"
-EXECUTION_CONFIG_SCHEMA_VERSION = "a2v-execution-config-v1"
+EXECUTION_CONFIG_SCHEMA_VERSION = "a2v-execution-config-v2"
 PRICE_EVIDENCE_MAX_AGE = timedelta(hours=24)
 PRICE_FETCH_TIMEOUT_SECONDS = 10
 MAX_PRICE_RESPONSE_BYTES = 1_048_576
@@ -125,7 +124,10 @@ EXECUTION_CONFIG_FIELDS = frozenset(
         "audio_preserve_pitch",
         "debug_dataset",
         "negative_prompt",
-        "validation",
+        "validation_number_of_frames",
+        "validation_frame_rate",
+        "validation_resolution",
+        "validation_aspect_ratio",
         "dataset_manifest_sha256",
         "training_archive_sha256",
         "standing_authorization_sha256",
@@ -135,19 +137,6 @@ EXECUTION_CONFIG_FIELDS = frozenset(
         "training_max_usd",
         "validation_allocation_usd",
         "cumulative_cap_usd",
-    }
-)
-VALIDATION_ENTRY_FIELDS = frozenset(
-    {
-        "image_filename",
-        "image_sha256",
-        "audio_filename",
-        "audio_sha256",
-        "prompt",
-        "frames",
-        "fps",
-        "resolution",
-        "aspect_ratio",
     }
 )
 TRIGGER_PHRASE_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{2,63}", re.ASCII)
@@ -367,71 +356,6 @@ def _canonical_text(value: Any, *, label: str) -> str:
     return value
 
 
-def _canonical_local_filename(value: Any, *, label: str, suffix: str) -> str:
-    if type(value) is not str:
-        raise ValueError(f"{label} must be a canonical local filename")
-    try:
-        safe_relative_name(value)
-    except ValueError as exc:
-        raise ValueError(f"{label} must be a canonical local filename") from exc
-    if "/" in value or not value.endswith(suffix):
-        raise ValueError(f"{label} must be a canonical local filename")
-    return value
-
-
-def _validate_validation_entries(value: Any) -> list[dict[str, Any]]:
-    if type(value) is not list or len(value) != 2:
-        raise ValueError("execution configuration requires exactly two validation entries")
-    entries: list[dict[str, Any]] = []
-    for index, item in enumerate(value):
-        entry = _exact_dict(
-            item,
-            VALIDATION_ENTRY_FIELDS,
-            label=f"validation entry {index}",
-        )
-        _canonical_local_filename(
-            entry["image_filename"],
-            label="validation image_filename",
-            suffix=".png",
-        )
-        _sha256(entry["image_sha256"], label="image_sha256")
-        _canonical_local_filename(
-            entry["audio_filename"],
-            label="validation audio_filename",
-            suffix=".wav",
-        )
-        _sha256(entry["audio_sha256"], label="audio_sha256")
-        _canonical_text(entry["prompt"], label="validation prompt")
-        if type(entry["frames"]) is not int or entry["frames"] != 89:
-            raise ValueError("validation frames mismatch")
-        if type(entry["fps"]) is not int or entry["fps"] != 24:
-            raise ValueError("validation fps mismatch")
-        if type(entry["resolution"]) is not str or entry["resolution"] != "high":
-            raise ValueError("validation resolution mismatch")
-        if type(entry["aspect_ratio"]) is not str or entry["aspect_ratio"] != "9:16":
-            raise ValueError("validation aspect ratio mismatch")
-        entries.append(entry)
-    canonical_entries = sorted(
-        entries,
-        key=lambda entry: (entry["image_filename"], entry["audio_filename"]),
-    )
-    image_names = [entry["image_filename"] for entry in entries]
-    audio_names = [entry["audio_filename"] for entry in entries]
-    if len(set(image_names)) != 2 or len(set(audio_names)) != 2:
-        raise ValueError("execution configuration requires canonical validation order")
-    if len({name.casefold() for name in image_names}) != 2:
-        raise ValueError(
-            "validation image filenames must be case-insensitively unique"
-        )
-    if len({name.casefold() for name in audio_names}) != 2:
-        raise ValueError(
-            "validation audio filenames must be case-insensitively unique"
-        )
-    if entries != canonical_entries:
-        raise ValueError("execution configuration requires canonical validation order")
-    return entries
-
-
 def _validate_execution_config(value: Any) -> dict[str, Any]:
     data = _exact_dict(
         value,
@@ -492,7 +416,26 @@ def _validate_execution_config(value: Any) -> dict[str, Any]:
     if data["debug_dataset"] is not False:
         raise ValueError("execution configuration debug_dataset must be false")
     _canonical_text(data["negative_prompt"], label="negative_prompt")
-    _validate_validation_entries(data["validation"])
+    if (
+        type(data["validation_number_of_frames"]) is not int
+        or data["validation_number_of_frames"] != 89
+    ):
+        raise ValueError("execution configuration validation number of frames mismatch")
+    if (
+        type(data["validation_frame_rate"]) is not int
+        or data["validation_frame_rate"] != 24
+    ):
+        raise ValueError("execution configuration validation frame rate mismatch")
+    if (
+        type(data["validation_resolution"]) is not str
+        or data["validation_resolution"] != "high"
+    ):
+        raise ValueError("execution configuration validation resolution mismatch")
+    if (
+        type(data["validation_aspect_ratio"]) is not str
+        or data["validation_aspect_ratio"] != "9:16"
+    ):
+        raise ValueError("execution configuration validation aspect ratio mismatch")
     for field in (
         "dataset_manifest_sha256",
         "training_archive_sha256",
@@ -511,6 +454,12 @@ def _validate_execution_config(value: Any) -> dict[str, Any]:
     if data["cumulative_cap_usd"] != CUMULATIVE_CAP_USD:
         raise ValueError("cumulative cap mismatch")
     return data
+
+
+def validate_execution_config(value: Any) -> dict[str, Any]:
+    """Return a defensive copy of an exact fixed A2V execution config."""
+
+    return dict(_validate_execution_config(value))
 
 
 @dataclass(frozen=True)
@@ -1076,7 +1025,7 @@ def _load_bundle(
         _load_canonical_object(policy_path), now=current
     )
     price = PriceEvidence.from_dict(_load_canonical_object(price_path), now=current)
-    config = _validate_execution_config(_load_canonical_object(config_path))
+    config = validate_execution_config(_load_canonical_object(config_path))
     _load_canonical_object(structural_path)
     _load_canonical_object(quality_path)
     _load_canonical_object(selection_path)
