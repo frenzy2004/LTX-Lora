@@ -570,15 +570,16 @@ def _ensure_path_identity(
 def _identity_anchor(path: Path) -> Iterator[os.stat_result]:
     descriptor: int | None = None
     try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | getattr(os, "O_BINARY", 0),
-        )
-        anchor = os.fstat(descriptor)
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+            anchor = os.fstat(descriptor)
+        except OSError as exc:
+            raise ValueError("ledger changed during verification") from exc
         _ensure_path_identity(path, anchor, expected_links=1)
         yield anchor
-    except OSError as exc:
-        raise ValueError("ledger changed during verification") from exc
     finally:
         if descriptor is not None:
             try:
@@ -727,10 +728,14 @@ def _write_connection(path: Path) -> Iterator[sqlite3.Connection]:
         yield connection
     finally:
         if connection is not None:
-            try:
-                connection.close()
-            except Exception:
-                pass
+            _close_quietly(connection)
+
+
+def _close_quietly(connection: sqlite3.Connection) -> None:
+    try:
+        connection.close()
+    except Exception:
+        pass
 
 
 def _rollback_quietly(connection: sqlite3.Connection) -> None:
@@ -1309,53 +1314,52 @@ def _validate_manifest_value(manifest: dict[str, Any]) -> None:
 def _commit_error_left_verified_write_effect(
     connection: sqlite3.Connection,
     canonical: Path,
+    anchor: os.stat_result,
     *,
     expected_pilot_id: str,
     expected_ledger_id: str,
     event: _EventEffect,
     reservation: _ReservationEffect | None = None,
 ) -> bool:
-    try:
-        transaction_is_active = connection.in_transaction
-    except Exception:
-        transaction_is_active = False
-    if transaction_is_active:
-        return False
-    try:
-        connection.close()
-    except Exception:
-        pass
+    _rollback_quietly(connection)
+    _close_quietly(connection)
     verified_on_reopen = False
     try:
-        with _read_connection(canonical) as reopened:
-            _verify_connection(
-                reopened,
-                expected_pilot_id=expected_pilot_id,
-                expected_ledger_id=expected_ledger_id,
-            )
-            event_rows = reopened.execute(
-                """
-                SELECT event_index, event_id, reservation_id, from_state,
-                       to_state, amount_usd, created_at_utc, previous_hash,
-                       reason_code, evidence_sha256, event_hash
-                FROM events WHERE event_id = ?
-                """,
-                (event.event_id,),
-            ).fetchall()
-            if event_rows != [event.database_row()]:
-                raise ValueError("committed event readback mismatch")
-            if reservation is not None:
-                reservation_rows = reopened.execute(
+        with _identity_anchor(canonical) as reopened_anchor:
+            if _object_identity(reopened_anchor) != _object_identity(anchor):
+                raise ValueError("ledger changed during verification")
+            _ensure_path_identity(canonical, anchor, expected_links=1)
+            with _read_connection(canonical) as reopened:
+                _ensure_path_identity(canonical, anchor, expected_links=1)
+                _verify_connection(
+                    reopened,
+                    expected_pilot_id=expected_pilot_id,
+                    expected_ledger_id=expected_ledger_id,
+                )
+                event_rows = reopened.execute(
                     """
-                    SELECT reservation_id, bundle_id, execution_id, amount_usd,
-                           created_at_utc, migration_id
-                    FROM reservations WHERE reservation_id = ?
+                    SELECT event_index, event_id, reservation_id, from_state,
+                           to_state, amount_usd, created_at_utc, previous_hash,
+                           reason_code, evidence_sha256, event_hash
+                    FROM events WHERE event_id = ?
                     """,
-                    (reservation.reservation_id,),
+                    (event.event_id,),
                 ).fetchall()
-                if reservation_rows != [reservation.database_row()]:
-                    raise ValueError("committed reservation readback mismatch")
-            verified_on_reopen = True
+                if event_rows != [event.database_row()]:
+                    raise ValueError("committed event readback mismatch")
+                if reservation is not None:
+                    reservation_rows = reopened.execute(
+                        """
+                        SELECT reservation_id, bundle_id, execution_id, amount_usd,
+                               created_at_utc, migration_id
+                        FROM reservations WHERE reservation_id = ?
+                        """,
+                        (reservation.reservation_id,),
+                    ).fetchall()
+                    if reservation_rows != [reservation.database_row()]:
+                        raise ValueError("committed reservation readback mismatch")
+                _ensure_path_identity(canonical, anchor, expected_links=1)
+                verified_on_reopen = True
     except Exception:
         pass
     return verified_on_reopen
@@ -1364,24 +1368,48 @@ def _commit_error_left_verified_write_effect(
 def _commit_with_verified_write_effect(
     connection: sqlite3.Connection,
     canonical: Path,
+    anchor: os.stat_result,
     *,
     expected_pilot_id: str,
     expected_ledger_id: str,
     event: _EventEffect,
     reservation: _ReservationEffect | None = None,
 ) -> None:
+    _ensure_path_identity(canonical, anchor, expected_links=1)
     try:
         connection.commit()
     except Exception:
         if not _commit_error_left_verified_write_effect(
             connection,
             canonical,
+            anchor,
             expected_pilot_id=expected_pilot_id,
             expected_ledger_id=expected_ledger_id,
             event=event,
             reservation=reservation,
         ):
             raise
+
+
+def _terminal_event_matches(
+    connection: sqlite3.Connection,
+    reservation_id: str,
+    *,
+    outcome: str,
+    reason_code: str,
+    evidence_sha256: str | None,
+) -> bool:
+    rows = connection.execute(
+        """
+        SELECT to_state, reason_code, evidence_sha256
+        FROM events
+        WHERE reservation_id = ?
+        ORDER BY event_index DESC
+        LIMIT 1
+        """,
+        (reservation_id,),
+    ).fetchall()
+    return rows == [(outcome, reason_code, evidence_sha256)]
 
 
 class PilotLedger:
@@ -1486,8 +1514,12 @@ class PilotLedger:
             migration_id=None,
         )
         canonical = _canonical_existing_file(self.path, label="ledger database")
-        with _write_connection(canonical) as connection:
+        with (
+            _identity_anchor(canonical) as anchor,
+            _write_connection(canonical) as connection,
+        ):
             _begin_immediate(connection)
+            _ensure_path_identity(canonical, anchor, expected_links=1)
             try:
                 snapshot = _verify_connection(
                     connection,
@@ -1506,15 +1538,20 @@ class PilotLedger:
                     raise RuntimeError("execution identity was already reserved")
                 if amount > CAP_USD - snapshot.committed:
                     raise RuntimeError("projected cost exceeds remaining budget")
-                connection.execute(
-                    """
-                    INSERT INTO reservations (
-                        reservation_id, bundle_id, execution_id, amount_usd,
-                        created_at_utc, migration_id
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    reservation_effect.database_row(),
-                )
+                try:
+                    connection.execute(
+                        """
+                        INSERT INTO reservations (
+                            reservation_id, bundle_id, execution_id, amount_usd,
+                            created_at_utc, migration_id
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        reservation_effect.database_row(),
+                    )
+                except sqlite3.IntegrityError:
+                    raise RuntimeError(
+                        "execution identity was already reserved"
+                    ) from None
                 event_effect = _append_event(
                     connection,
                     snapshot=snapshot,
@@ -1529,14 +1566,12 @@ class PilotLedger:
                 _commit_with_verified_write_effect(
                     connection,
                     canonical,
+                    anchor,
                     expected_pilot_id=self._expected_pilot_id,
                     expected_ledger_id=self._expected_ledger_id,
                     event=event_effect,
                     reservation=reservation_effect,
                 )
-            except sqlite3.IntegrityError:
-                _rollback_quietly(connection)
-                raise RuntimeError("execution identity was already reserved") from None
             except Exception:
                 _rollback_quietly(connection)
                 raise
@@ -1555,6 +1590,73 @@ class PilotLedger:
     ) -> Reservation:
         return self.reserve(bundle_id, execution_id, amount_usd)
 
+    def recover_reservation(
+        self,
+        bundle_id: str,
+        execution_id: str,
+        amount_usd: Decimal | str,
+    ) -> Reservation:
+        _bundle_identity(bundle_id)
+        _typed_id(execution_id, EXECUTION_ID_PATTERN, label="execution_id")
+        amount, amount_text = _reservation_money(amount_usd)
+        canonical = _canonical_existing_file(self.path, label="ledger database")
+        with _identity_anchor(canonical) as anchor:
+            with _read_connection(canonical) as connection:
+                _verify_connection(
+                    connection,
+                    expected_pilot_id=self._expected_pilot_id,
+                    expected_ledger_id=self._expected_ledger_id,
+                )
+                reservation_rows = connection.execute(
+                    """
+                    SELECT reservation_id, bundle_id, execution_id, amount_usd,
+                           created_at_utc, migration_id
+                    FROM reservations
+                    WHERE bundle_id = ? OR execution_id = ?
+                    ORDER BY reservation_id
+                    """,
+                    (bundle_id, execution_id),
+                ).fetchall()
+                if len(reservation_rows) != 1:
+                    raise RuntimeError(
+                        "reservation recovery could not verify an exact prior reservation"
+                    )
+                reservation_row = reservation_rows[0]
+                if (
+                    reservation_row[1] != bundle_id
+                    or reservation_row[2] != execution_id
+                    or reservation_row[3] != amount_text
+                    or reservation_row[5] is not None
+                ):
+                    raise RuntimeError(
+                        "reservation recovery could not verify an exact prior reservation"
+                    )
+                creation_rows = connection.execute(
+                    """
+                    SELECT from_state, to_state, amount_usd, reason_code,
+                           evidence_sha256
+                    FROM events
+                    WHERE reservation_id = ?
+                    ORDER BY event_index
+                    LIMIT 1
+                    """,
+                    (reservation_row[0],),
+                ).fetchall()
+                if creation_rows != [
+                    (None, "reserved", amount_text, "reservation_created", None)
+                ]:
+                    raise RuntimeError(
+                        "reservation recovery could not verify an exact prior reservation"
+                    )
+                recovered = Reservation(
+                    id=reservation_row[0],
+                    amount=amount,
+                    bundle_id=bundle_id,
+                    execution_id=execution_id,
+                )
+                _ensure_path_identity(canonical, anchor, expected_links=1)
+        return recovered
+
     def transition(self, reservation_id: str, to_state: str) -> None:
         _typed_id(
             reservation_id,
@@ -1566,8 +1668,12 @@ class PilotLedger:
         event_id = _new_typed_id("event")
         event_created_at = _current_utc()
         canonical = _canonical_existing_file(self.path, label="ledger database")
-        with _write_connection(canonical) as connection:
+        with (
+            _identity_anchor(canonical) as anchor,
+            _write_connection(canonical) as connection,
+        ):
             _begin_immediate(connection)
+            _ensure_path_identity(canonical, anchor, expected_links=1)
             try:
                 snapshot = _verify_connection(
                     connection,
@@ -1580,6 +1686,15 @@ class PilotLedger:
                 except KeyError:
                     raise KeyError("unknown reservation") from None
                 if current == to_state:
+                    if not _terminal_event_matches(
+                        connection,
+                        reservation_id,
+                        outcome=to_state,
+                        reason_code="state_transition",
+                        evidence_sha256=None,
+                    ):
+                        raise RuntimeError("terminal state provenance mismatch")
+                    _ensure_path_identity(canonical, anchor, expected_links=1)
                     _rollback_quietly(connection)
                     return
                 if (current, to_state) not in NORMAL_TRANSITIONS:
@@ -1598,6 +1713,7 @@ class PilotLedger:
                 _commit_with_verified_write_effect(
                     connection,
                     canonical,
+                    anchor,
                     expected_pilot_id=self._expected_pilot_id,
                     expected_ledger_id=self._expected_ledger_id,
                     event=event_effect,
@@ -1623,8 +1739,12 @@ class PilotLedger:
         event_id = _new_typed_id("event")
         event_created_at = _current_utc()
         canonical = _canonical_existing_file(self.path, label="ledger database")
-        with _write_connection(canonical) as connection:
+        with (
+            _identity_anchor(canonical) as anchor,
+            _write_connection(canonical) as connection,
+        ):
             _begin_immediate(connection)
+            _ensure_path_identity(canonical, anchor, expected_links=1)
             try:
                 snapshot = _verify_connection(
                     connection,
@@ -1637,6 +1757,15 @@ class PilotLedger:
                 except KeyError:
                     raise KeyError("unknown reservation") from None
                 if current == "released":
+                    if not _terminal_event_matches(
+                        connection,
+                        reservation_id,
+                        outcome="released",
+                        reason_code="pre_submit_release",
+                        evidence_sha256=None,
+                    ):
+                        raise RuntimeError("terminal state provenance mismatch")
+                    _ensure_path_identity(canonical, anchor, expected_links=1)
                     _rollback_quietly(connection)
                     return
                 if current not in {"reserved", "uploading"}:
@@ -1655,6 +1784,7 @@ class PilotLedger:
                 _commit_with_verified_write_effect(
                     connection,
                     canonical,
+                    anchor,
                     expected_pilot_id=self._expected_pilot_id,
                     expected_ledger_id=self._expected_ledger_id,
                     event=event_effect,
@@ -1681,8 +1811,12 @@ class PilotLedger:
         event_id = _new_typed_id("event")
         event_created_at = _current_utc()
         canonical = _canonical_existing_file(self.path, label="ledger database")
-        with _write_connection(canonical) as connection:
+        with (
+            _identity_anchor(canonical) as anchor,
+            _write_connection(canonical) as connection,
+        ):
             _begin_immediate(connection)
+            _ensure_path_identity(canonical, anchor, expected_links=1)
             try:
                 snapshot = _verify_connection(
                     connection,
@@ -1695,6 +1829,15 @@ class PilotLedger:
                 except KeyError:
                     raise KeyError("unknown reservation") from None
                 if current == outcome:
+                    if not _terminal_event_matches(
+                        connection,
+                        reservation_id,
+                        outcome=outcome,
+                        reason_code="provider_reconciliation",
+                        evidence_sha256=evidence,
+                    ):
+                        raise RuntimeError("terminal state provenance mismatch")
+                    _ensure_path_identity(canonical, anchor, expected_links=1)
                     _rollback_quietly(connection)
                     return
                 if current not in {"submit_started", "submitted"}:
@@ -1714,6 +1857,7 @@ class PilotLedger:
                 _commit_with_verified_write_effect(
                     connection,
                     canonical,
+                    anchor,
                     expected_pilot_id=self._expected_pilot_id,
                     expected_ledger_id=self._expected_ledger_id,
                     event=event_effect,
