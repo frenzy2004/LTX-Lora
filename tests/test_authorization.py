@@ -1001,7 +1001,10 @@ def test_receipt_hashes_are_the_exact_bound_artifacts(tmp_path: Path) -> None:
 
 
 def test_price_capture_binds_official_url_formula_hash_and_24_hour_expiry() -> None:
-    response = b"Training costs 0.006 * steps; 1000 steps cost $6.00."
+    response = (
+        f"{ENDPOINT} Training costs 0.006 * steps; "
+        "1000 steps cost $6.00."
+    ).encode("ascii")
     requested_urls: list[str] = []
 
     def fetch(url: str) -> bytes:
@@ -1020,6 +1023,16 @@ def test_price_capture_binds_official_url_formula_hash_and_24_hour_expiry() -> N
     assert requested_urls == [OFFICIAL_PRICE_URL]
 
 
+def test_price_capture_requires_exact_a2v_page_marker() -> None:
+    response = b"Training costs 0.006 * steps; 1000 steps cost $6.00."
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
 def test_price_capture_requires_official_formula() -> None:
     fetch = lambda _url: b"The cost is 0.007 * steps."
 
@@ -1027,7 +1040,7 @@ def test_price_capture_requires_official_formula() -> None:
         _api().capture_price_evidence(fetch=fetch, now=FIXED_TIME)
 
 
-def test_price_capture_isolates_a2v_and_accepts_identical_live_duplicates() -> None:
+def test_price_capture_rejects_conflicting_price_anywhere_on_exact_page() -> None:
     response = (
         b'<section data-model="fal-ai/other">$0.007 per step; $0.007 * steps; '
         b'1000 steps cost $7.00.</section>'
@@ -1035,6 +1048,22 @@ def test_price_capture_isolates_a2v_and_accepts_identical_live_duplicates() -> N
         b'$0.006 per step; 1000 steps cost $6.00.</section>'
         b'<section data-model="fal-ai/other-after">$0.009 per step; $0.009 * steps; '
         b'1000 steps cost $9.00.</section>'
+        b'<script>{"endpoint":"fal-ai/ltx23-trainer-v2/a2v",'
+        b'"formula":"0.006 * steps","example":"1000 steps costs $6.00"}'
+        b"</script>"
+    )
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+def test_price_capture_accepts_identical_live_a2v_duplicates() -> None:
+    response = (
+        b'<section data-model="fal-ai/ltx23-trainer-v2/a2v">0.006 * steps; '
+        b'$0.006 per step; 1000 steps cost $6.00.</section>'
         b'<script>{"endpoint":"fal-ai/ltx23-trainer-v2/a2v",'
         b'"formula":"0.006 * steps","example":"1000 steps costs $6.00"}'
         b"</script>"
@@ -1093,6 +1122,225 @@ def test_price_capture_rejects_punctuated_reverse_order_a2v_rate() -> None:
     response = (
         f'<section data-model="{ENDPOINT}">per step rate is $0.007. '
         "Archived calculator: 0.006 * steps; 1000 steps cost $6.00.</section>"
+    ).encode("ascii")
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    "alternate_rate",
+    [
+        "$0.007/training-step",
+        "The step fee is $0.007",
+        "The step charge is $0.007",
+        "$0.007 per\N{NO-BREAK SPACE}step",
+        "$0.007 <span>per step</span>",
+        "$.007 per step",
+        "$0.007 per optimization step",
+        "The step fee is 0.007",
+        "0.007 per optimization step",
+        "$0.007 per&nbsp;step",
+    ],
+)
+def test_price_capture_rejects_normalized_or_unlisted_unit_rate_forms(
+    alternate_rate: str,
+) -> None:
+    response = (
+        f'<section data-model="{ENDPOINT}">{alternate_rate}; '
+        "Archived calculator: 0.006 * steps; "
+        "1000 steps cost $6.00.</section>"
+    ).encode("utf-8")
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+def test_price_capture_inspects_rate_before_first_a2v_endpoint_marker() -> None:
+    response = (
+        f'Current rate: $0.007 per step. <section data-model="{ENDPOINT}">'
+        "Archived calculator: 0.006 * steps; "
+        "1000 steps cost $6.00.</section>"
+    ).encode("ascii")
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+def test_price_capture_inspects_page_prefix_before_other_model_marker() -> None:
+    response = (
+        "Current rate: $0.007 per step. "
+        '<section data-model="fal-ai/other">Other model details.</section>'
+        f'<section data-model="{ENDPOINT}">'
+        "Archived calculator: 0.006 * steps; "
+        "1000 steps cost $6.00.</section>"
+    ).encode("ascii")
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+def test_price_capture_inspects_page_prefix_between_model_sections() -> None:
+    response = (
+        '<section data-model="fal-ai/other">Other model details.</section>'
+        "Current rate: $0.007 per step. "
+        f'<section data-model="{ENDPOINT}">'
+        "Archived calculator: 0.006 * steps; "
+        "1000 steps cost $6.00.</section>"
+    ).encode("ascii")
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+def test_price_capture_inspects_a2v_price_attribute_before_model_marker() -> None:
+    response = (
+        '<section data-model="fal-ai/other">Other model details.</section>'
+        '<section data-price="$0.007 per step" '
+        f'data-model="{ENDPOINT}">'
+        "Archived calculator: 0.006 * steps; "
+        "1000 steps cost $6.00.</section>"
+    ).encode("ascii")
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    "a2v_prefix",
+    [
+        '"price":"$0.007 per step",',
+        '"formula":"0.007 x steps",',
+    ],
+)
+def test_price_capture_inspects_a2v_json_fields_before_endpoint_key(
+    a2v_prefix: str,
+) -> None:
+    response = (
+        '<script>{"endpoint":"fal-ai/other",'
+        '"price":"$0.009 per step"}</script>'
+        f'<script>{{{a2v_prefix}"endpoint":"{ENDPOINT}",'
+        '"formula":"0.006 * steps",'
+        '"example":"1000 steps cost $6.00"}</script>'
+    ).encode("ascii")
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+def test_price_capture_rejects_conflicting_object_within_shared_script() -> None:
+    response = (
+        '<script>[{"endpoint":"fal-ai/other",'
+        '"price":"$0.009 per step","formula":"0.009 * steps",'
+        '"example":"1000 steps cost $9.00"},'
+        '{"price":"$0.006 per step",'
+        f'"endpoint":"{ENDPOINT}","formula":"0.006 * steps",'
+        '"example":"1000 steps cost $6.00"}]</script>'
+    ).encode("ascii")
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    "alternate_formula",
+    [
+        "Current formula: 0.007 \N{MULTIPLICATION SIGN} steps.",
+        "Current formula: 0.007 x steps.",
+        "Current formula: 0.007 times steps.",
+        "Current formula: 0.007 \N{MIDDLE DOT} steps.",
+        "Current formula: 0.007 multiplied by steps.",
+        "Current formula: steps * 0.007.",
+        "Current formula: steps multiplied by 0.007.",
+        "0.007 multiplied by steps.",
+        "steps multiplied by 0.007.",
+    ],
+)
+def test_price_capture_rejects_alternate_or_reversed_changed_formulas(
+    alternate_formula: str,
+) -> None:
+    response = (
+        f'<section data-model="{ENDPOINT}">{alternate_formula} '
+        "Archived calculator: 0.006 * steps; "
+        "1000 steps cost $6.00.</section>"
+    ).encode("utf-8")
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "LTX 2.3 costs 0.006 USD per step;",
+        "Version 2.3 supports 1000 steps at 0.006 USD per step;",
+    ],
+)
+def test_price_capture_binds_usd_to_its_adjacent_amount(statement: str) -> None:
+    response = (
+        f'<section data-model="{ENDPOINT}">{statement} '
+        "0.006 * steps; 1000 steps cost $6.00.</section>"
+    ).encode("ascii")
+
+    evidence = _api().capture_price_evidence(
+        fetch=lambda _url: response,
+        now=FIXED_TIME,
+    )
+
+    assert evidence.rate_usd_per_step == "0.006"
+
+
+def test_price_capture_keeps_model_version_out_of_reverse_formula() -> None:
+    response = (
+        f'<section data-model="{ENDPOINT}">'
+        "LTX 2.3 formula: steps multiplied by 0.006; "
+        "1000 steps cost $6.00; 0.006 * steps.</section>"
+    ).encode("ascii")
+
+    evidence = _api().capture_price_evidence(
+        fetch=lambda _url: response,
+        now=FIXED_TIME,
+    )
+
+    assert evidence.rate_usd_per_step == "0.006"
+
+
+@pytest.mark.parametrize("separator", ["; ", ". "])
+def test_price_capture_associates_nearby_labeled_rate_with_step_unit(
+    separator: str,
+) -> None:
+    response = (
+        f'<section data-model="{ENDPOINT}">Each step is billed separately'
+        f"{separator}the current rate is $0.007. "
+        "Archived calculator: 0.006 * steps; "
+        "1000 steps cost $6.00.</section>"
     ).encode("ascii")
 
     with pytest.raises(ValueError, match="unexpected A2V rate"):
@@ -1229,9 +1477,15 @@ def test_price_capture_keeps_unit_rates_out_of_aggregate_costs(
 @pytest.mark.parametrize(
     ("response", "message"),
     [
-        (b"Training costs $0.006 * steps.", "unexpected 1,000-step cost"),
         (
-            b"Training costs $0.006 * steps; 1,000 steps cost $7.00.",
+            f"{ENDPOINT} Training costs $0.006 * steps.".encode("ascii"),
+            "unexpected 1,000-step cost",
+        ),
+        (
+            (
+                f"{ENDPOINT} Training costs $0.006 * steps; "
+                "1,000 steps cost $7.00."
+            ).encode("ascii"),
             "unexpected 1,000-step cost",
         ),
     ],
@@ -1561,7 +1815,10 @@ def test_concurrent_recorders_publish_exactly_one_complete_authorization(
 def test_price_command_writes_only_canonical_minimal_evidence(tmp_path: Path) -> None:
     price_command = _load_script(PRICE_SCRIPT)
     output_path = tmp_path / "price-evidence.json"
-    response = b"Training costs $0.006 * steps; 1,000 steps cost $6.00."
+    response = (
+        f"{ENDPOINT} Training costs $0.006 * steps; "
+        "1,000 steps cost $6.00."
+    ).encode("ascii")
 
     price_command._capture(
         output_path,
@@ -1605,8 +1862,14 @@ def test_concurrent_price_captures_publish_exactly_one_complete_evidence(
         synchronized_capture,
     )
     responses = [
-        b"variant-a: 0.006 * steps; 1000 steps cost $6.00.",
-        b"variant-b: 0.006 * steps; 1000 steps cost $6.00.",
+        (
+            f"{ENDPOINT} variant-a: 0.006 * steps; "
+            "1000 steps cost $6.00."
+        ).encode("ascii"),
+        (
+            f"{ENDPOINT} variant-b: 0.006 * steps; "
+            "1000 steps cost $6.00."
+        ).encode("ascii"),
     ]
 
     def attempt(response: bytes) -> Any:

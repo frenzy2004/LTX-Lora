@@ -7,6 +7,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from html import unescape as html_unescape
 from pathlib import Path
 from typing import Any, Callable, Mapping
 from urllib import request as urllib_request
@@ -148,10 +149,23 @@ VALIDATION_ENTRY_FIELDS = frozenset(
     }
 )
 TRIGGER_PHRASE_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{2,63}", re.ASCII)
-RATE_FORMULA_PATTERN = re.compile(
+RATE_FORMULA_OPERATOR = (
+    r"(?:\*|x|times|multiplied\s+by|"
+    r"\N{MULTIPLICATION SIGN}|\N{MIDDLE DOT})"
+)
+RATE_BEFORE_STEPS_FORMULA_PATTERN = re.compile(
     r"(?<![0-9.])(?P<currency>\$?)(?P<rate>[0-9]+\.[0-9]+)"
-    r"\s*\*\s*steps\b",
+    rf"\s*{RATE_FORMULA_OPERATOR}\s*steps\b",
     re.IGNORECASE | re.ASCII,
+)
+RATE_AFTER_STEPS_FORMULA_PATTERN = re.compile(
+    rf"\bsteps\s*{RATE_FORMULA_OPERATOR}\s*"
+    r"(?P<currency>\$?)(?P<rate>[0-9]+\.[0-9]+)(?![0-9]|\.[0-9])",
+    re.IGNORECASE | re.ASCII,
+)
+RATE_FORMULA_PATTERNS = (
+    RATE_BEFORE_STEPS_FORMULA_PATTERN,
+    RATE_AFTER_STEPS_FORMULA_PATTERN,
 )
 UNIT_STEP_RATE_MODIFIERS = (
     r"(?:(?:additional|individual|training)[\s-]+){0,3}"
@@ -239,6 +253,48 @@ MODEL_ENDPOINT_PATTERN = re.compile(
     r"fal-ai/[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*",
     re.IGNORECASE | re.ASCII,
 )
+HTML_TAG_PATTERN = re.compile(r"<[^<>]*>", re.DOTALL)
+HTML_ATTRIBUTE_VALUE_PATTERN = re.compile(
+    r'''=\s*(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)')''',
+    re.DOTALL,
+)
+MONETARY_DECIMAL_PATTERN = re.compile(
+    r"(?<![0-9.])(?P<currency>\$)?"
+    r"(?P<amount>(?:[0-9]+\.[0-9]+|\.[0-9]+))"
+    r"(?![0-9]|\.[0-9])",
+    re.ASCII,
+)
+STEP_WORD_PATTERN = re.compile(r"\bsteps?\b", re.IGNORECASE | re.ASCII)
+THOUSAND_STEP_PATTERN = re.compile(
+    r"\b1,?000[\s-]+steps?\b",
+    re.IGNORECASE | re.ASCII,
+)
+USD_BEFORE_AMOUNT_PATTERN = re.compile(
+    r"\bUSD\s*$",
+    re.IGNORECASE | re.ASCII,
+)
+USD_AFTER_AMOUNT_PATTERN = re.compile(
+    r"\s*USD\b",
+    re.IGNORECASE | re.ASCII,
+)
+PRICE_LABEL_PATTERN = re.compile(
+    r"\b(?:rate|price|fee|charge|cost)\b",
+    re.IGNORECASE | re.ASCII,
+)
+FORMULA_LABEL_PATTERN = re.compile(r"\bformula\b", re.IGNORECASE | re.ASCII)
+UNMARKED_PER_STEP_AFTER_PATTERN = re.compile(
+    r"\s*(?:/|per\b)[^0-9.;?!<>\r\n]{0,48}\bstep\b",
+    re.IGNORECASE | re.ASCII,
+)
+FORMULA_STEP_AFTER_AMOUNT_PATTERN = re.compile(
+    r"[^0-9.;?!<>\r\n]{0,64}\bsteps?\b",
+    re.IGNORECASE | re.ASCII,
+)
+FORMULA_STEP_BEFORE_AMOUNT_PATTERN = re.compile(
+    r"\bsteps?\b[^0-9.;?!<>\r\n]{0,64}$",
+    re.IGNORECASE | re.ASCII,
+)
+PRICE_CLAUSE_BOUNDARY_PATTERN = re.compile(r"[;?!\r\n]|\.(?![0-9])")
 
 
 def _exact_dict(value: Any, fields: frozenset[str], *, label: str) -> dict[str, Any]:
@@ -592,33 +648,111 @@ def _fetch_official_price(url: str) -> bytes:
 
 def _a2v_price_contexts(text: str) -> list[str]:
     markers = list(MODEL_ENDPOINT_PATTERN.finditer(text))
-    if not markers:
-        return [text]
-    contexts: list[str] = []
-    for index, marker in enumerate(markers):
-        if marker.group(0).lower() != A2V_ENDPOINT:
-            continue
-        end = markers[index + 1].start() if index + 1 < len(markers) else len(text)
-        contexts.append(text[marker.start() : end])
-    return contexts
+    if not any(
+        marker.group(0).lower() == A2V_ENDPOINT for marker in markers
+    ):
+        return []
+    return [text]
+
+
+def _replace_price_tag(match: re.Match[str]) -> str:
+    values = [
+        attribute.group("double") or attribute.group("single") or ""
+        for attribute in HTML_ATTRIBUTE_VALUE_PATTERN.finditer(match.group(0))
+    ]
+    return " " + " ".join(values) + " "
+
+
+def _normalize_price_context(text: str) -> str:
+    return " ".join(HTML_TAG_PATTERN.sub(_replace_price_tag, text).split())
+
+
+def _bounded_price_clause(context: str, start: int, end: int) -> str:
+    left = context[max(0, start - 96) : start]
+    right = context[end : min(len(context), end + 96)]
+    left_clause = PRICE_CLAUSE_BOUNDARY_PATTERN.split(left)[-1]
+    right_clause = PRICE_CLAUSE_BOUNDARY_PATTERN.split(right)[0]
+    return left_clause + context[start:end] + right_clause
+
+
+def _step_associated_monetary_matches(
+    context: str,
+) -> list[tuple[re.Match[str], str]]:
+    matches: list[tuple[re.Match[str], str]] = []
+    for match in MONETARY_DECIMAL_PATTERN.finditer(context):
+        clause = _bounded_price_clause(context, *match.span("amount"))
+        if match.group("currency") is None:
+            usd_before = context[
+                max(0, match.start("amount") - 8) : match.start("amount")
+            ]
+            usd_after = context[match.end("amount") : match.end("amount") + 8]
+            if (
+                USD_BEFORE_AMOUNT_PATTERN.search(usd_before) is None
+                and USD_AFTER_AMOUNT_PATTERN.match(usd_after) is None
+            ):
+                rate_suffix = context[
+                    match.end("amount") : match.end("amount") + 64
+                ]
+                rate_prefix = context[
+                    max(0, match.start("amount") - 64) : match.start("amount")
+                ]
+                formula_binding = (
+                    FORMULA_LABEL_PATTERN.search(rate_prefix) is not None
+                    and (
+                        FORMULA_STEP_AFTER_AMOUNT_PATTERN.match(rate_suffix)
+                        is not None
+                        or FORMULA_STEP_BEFORE_AMOUNT_PATTERN.search(rate_prefix)
+                        is not None
+                    )
+                )
+                if (
+                    PRICE_LABEL_PATTERN.search(clause) is None
+                    and UNMARKED_PER_STEP_AFTER_PATTERN.match(rate_suffix)
+                    is None
+                    and not formula_binding
+                ):
+                    continue
+        if STEP_WORD_PATTERN.search(clause) is None:
+            if PRICE_LABEL_PATTERN.search(clause) is None:
+                continue
+            neighborhood = context[
+                max(0, match.start("amount") - 160) : min(
+                    len(context), match.end("amount") + 160
+                )
+            ]
+            if STEP_WORD_PATTERN.search(neighborhood) is None:
+                continue
+            clause = neighborhood
+        matches.append((match, clause))
+    return matches
+
+
+def _rate_formula_matches(context: str) -> list[re.Match[str]]:
+    return [
+        match
+        for pattern in RATE_FORMULA_PATTERNS
+        for match in pattern.finditer(context)
+    ]
 
 
 def _verify_price_statement(content: bytes) -> None:
     try:
-        text = content.decode("utf-8", errors="strict")
+        text = html_unescape(content.decode("utf-8", errors="strict"))
     except UnicodeDecodeError as exc:
         raise ValueError("official price response must be UTF-8") from exc
-    contexts = _a2v_price_contexts(text)
+    contexts = [
+        _normalize_price_context(context) for context in _a2v_price_contexts(text)
+    ]
     formula_rates = {
         match.group("rate")
         for context in contexts
-        for match in RATE_FORMULA_PATTERN.finditer(context)
+        for match in _rate_formula_matches(context)
     }
     explicit_rates = set(formula_rates)
     costs: set[str] = set()
     for context in contexts:
         formula_spans = {
-            match.span("rate") for match in RATE_FORMULA_PATTERN.finditer(context)
+            match.span("rate") for match in _rate_formula_matches(context)
         }
         rate_before_matches = list(
             RATE_PER_STEP_BEFORE_PATTERN.finditer(context)
@@ -674,6 +808,17 @@ def _verify_price_statement(content: bytes) -> None:
         rate_matches = strong_rate_matches + weak_rate_matches
         explicit_rates.update(match.group("rate") for match in rate_matches)
         costs.update(match.group("cost") for match in cost_matches)
+        classified_spans = strong_rate_spans | cost_spans | {
+            match.span("rate") for match in weak_rate_matches
+        }
+        for match, clause in _step_associated_monetary_matches(context):
+            if match.span("amount") in classified_spans:
+                continue
+            amount = match.group("amount")
+            if amount == "6.00" and THOUSAND_STEP_PATTERN.search(clause):
+                costs.add(amount)
+            else:
+                explicit_rates.add(amount)
     if (
         formula_rates != {A2V_RATE_USD_PER_STEP}
         or explicit_rates != {A2V_RATE_USD_PER_STEP}
