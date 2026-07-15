@@ -749,6 +749,45 @@ def test_issuer_rejects_malformed_nested_validation_entries(
 
 
 @pytest.mark.parametrize(
+    ("field", "suffix", "message"),
+    [
+        (
+            "image_filename",
+            ".png",
+            "validation image filenames must be case-insensitively unique",
+        ),
+        (
+            "audio_filename",
+            ".wav",
+            "validation audio filenames must be case-insensitively unique",
+        ),
+    ],
+)
+def test_issuer_rejects_casefold_colliding_validation_filenames(
+    tmp_path: Path,
+    field: str,
+    suffix: str,
+    message: str,
+) -> None:
+    config = _execution_config()
+    validation = copy.deepcopy(config["validation"])
+    validation[0][field] = f"Validation{suffix}"
+    validation[1][field] = f"validation{suffix}"
+    config["validation"] = validation
+    run_dir, _, bundle_id = _write_bundle(tmp_path, config=config)
+
+    with pytest.raises(ValueError, match=message):
+        _api().issue_execution_receipt(
+            valid_policy(),
+            run_dir,
+            expected_bundle_id=bundle_id,
+            approval_id=APPROVAL_ID,
+            issuer_process_id=ISSUER_PROCESS_ID,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
     ("field", "value", "message"),
     [
         ("dataset_manifest_sha256", "0" * 64, "dataset manifest hash mismatch"),
@@ -990,11 +1029,11 @@ def test_price_capture_requires_official_formula() -> None:
 
 def test_price_capture_isolates_a2v_and_accepts_identical_live_duplicates() -> None:
     response = (
-        b'<section data-model="fal-ai/other">$0.007 * steps; '
+        b'<section data-model="fal-ai/other">$0.007 per step; $0.007 * steps; '
         b'1000 steps cost $7.00.</section>'
         b'<section data-model="fal-ai/ltx23-trainer-v2/a2v">0.006 * steps; '
-        b'1000 steps cost $6.00.</section>'
-        b'<section data-model="fal-ai/other-after">$0.009 * steps; '
+        b'$0.006 per step; 1000 steps cost $6.00.</section>'
+        b'<section data-model="fal-ai/other-after">$0.009 per step; $0.009 * steps; '
         b'1000 steps cost $9.00.</section>'
         b'<script>{"endpoint":"fal-ai/ltx23-trainer-v2/a2v",'
         b'"formula":"0.006 * steps","example":"1000 steps costs $6.00"}'
@@ -1017,6 +1056,44 @@ def test_price_capture_rejects_conflicting_a2v_anchored_serializations() -> None
         b'<section data-model="fal-ai/ltx23-trainer-v2/a2v">0.007 * steps; '
         b'1000 steps cost $7.00.</section>'
     )
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+@pytest.mark.parametrize(
+    "alternate_rate",
+    [
+        "$0.007 per step",
+        "0.007 USD per training step",
+        "$0.007/step",
+        "per step rate is $0.007",
+    ],
+)
+def test_price_capture_rejects_a2v_scoped_alternate_rate_wording(
+    alternate_rate: str,
+) -> None:
+    response = (
+        f'<section data-model="{ENDPOINT}">{alternate_rate}; '
+        f"{'archived-' * 12} calculator: 0.006 * steps; "
+        "1000 steps cost $6.00.</section>"
+    ).encode("ascii")
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
+def test_price_capture_rejects_punctuated_reverse_order_a2v_rate() -> None:
+    response = (
+        f'<section data-model="{ENDPOINT}">per step rate is $0.007. '
+        "Archived calculator: 0.006 * steps; 1000 steps cost $6.00.</section>"
+    ).encode("ascii")
 
     with pytest.raises(ValueError, match="unexpected A2V rate"):
         _api().capture_price_evidence(
@@ -1305,6 +1382,58 @@ def test_standing_authorization_recorder_sanitizes_argument_and_runtime_errors(
     assert sensitive not in parse_output.err + runtime_output.err
 
 
+def test_concurrent_recorders_publish_exactly_one_complete_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_path = tmp_path / "synthetic-source.txt"
+    output_path = tmp_path / "standing-authorization.json"
+    source_path.write_bytes(b"synthetic standing authorization source")
+    recorder = _load_script(RECORD_SCRIPT)
+    original_hash = recorder.sha256_file
+    publication_barrier = threading.Barrier(2)
+
+    def synchronized_hash(path: Path) -> Any:
+        digest = original_hash(path)
+        publication_barrier.wait(timeout=10)
+        return digest
+
+    monkeypatch.setattr(recorder, "sha256_file", synchronized_hash)
+    policy_ids = [
+        "policy_0000000000004000800000000000000b",
+        "policy_0000000000004000800000000000000c",
+    ]
+
+    def attempt(policy_id: str) -> Any:
+        try:
+            return recorder._record(
+                source_path,
+                output_path,
+                policy_id=policy_id,
+                expires_at_utc="2026-07-17T02:00:00Z",
+                now=FIXED_TIME,
+            )
+        except Exception as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(attempt, policy_ids))
+
+    policies = [
+        result for result in results if isinstance(result, _api().StandingAuthorization)
+    ]
+    failures = [result for result in results if isinstance(result, Exception)]
+    assert len(policies) == 1
+    assert len(failures) == 1
+    assert str(failures[0]) == "authorization destination already exists"
+
+    serialized = output_path.read_bytes()
+    published = json.loads(serialized)
+    assert serialized == canonical_json_bytes(published)
+    assert published == policies[0].to_dict()
+    assert not list(output_path.parent.glob(".standing-authorization.json.*.tmp"))
+
+
 def test_price_command_writes_only_canonical_minimal_evidence(tmp_path: Path) -> None:
     price_command = _load_script(PRICE_SCRIPT)
     output_path = tmp_path / "price-evidence.json"
@@ -1330,6 +1459,56 @@ def test_price_command_writes_only_canonical_minimal_evidence(tmp_path: Path) ->
         "retrieved_at_utc",
         "expires_at_utc",
     }
+
+
+def test_concurrent_price_captures_publish_exactly_one_complete_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    price_command = _load_script(PRICE_SCRIPT)
+    output_path = tmp_path / "price-evidence.json"
+    original_capture = price_command.capture_price_evidence
+    publication_barrier = threading.Barrier(2)
+
+    def synchronized_capture(*args: Any, **kwargs: Any) -> Any:
+        evidence = original_capture(*args, **kwargs)
+        publication_barrier.wait(timeout=10)
+        return evidence
+
+    monkeypatch.setattr(
+        price_command,
+        "capture_price_evidence",
+        synchronized_capture,
+    )
+    responses = [
+        b"variant-a: 0.006 * steps; 1000 steps cost $6.00.",
+        b"variant-b: 0.006 * steps; 1000 steps cost $6.00.",
+    ]
+
+    def attempt(response: bytes) -> Any:
+        try:
+            return price_command._capture(
+                output_path,
+                fetch=lambda _url: response,
+                now=FIXED_TIME,
+            )
+        except Exception as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(attempt, responses))
+
+    evidence = [result for result in results if isinstance(result, _api().PriceEvidence)]
+    failures = [result for result in results if isinstance(result, Exception)]
+    assert len(evidence) == 1
+    assert len(failures) == 1
+    assert str(failures[0]) == "price evidence destination already exists"
+
+    serialized = output_path.read_bytes()
+    published = json.loads(serialized)
+    assert serialized == canonical_json_bytes(published)
+    assert published == evidence[0].to_dict()
+    assert not list(output_path.parent.glob(".price-evidence.json.*.tmp"))
 
 
 def test_issuer_writes_once_and_has_no_paid_capabilities(

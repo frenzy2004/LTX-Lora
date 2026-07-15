@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import os
+import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
-from ltx_lora_pilot.artifacts import atomic_write_json
+from ltx_lora_pilot.artifacts import canonical_json_bytes
 from ltx_lora_pilot.authorization import PriceEvidence, capture_price_evidence
 
 
@@ -21,6 +23,30 @@ def _is_symlink_or_junction(path: Path) -> bool:
     return bool(is_junction is not None and is_junction())
 
 
+def _exclusive_atomic_write_json(path: Path, value: Any) -> None:
+    content = canonical_json_bytes(value)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary_path = Path(output.name)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError as exc:
+            raise ValueError("price evidence destination already exists") from exc
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def _capture(
     output: Path,
     *,
@@ -33,7 +59,7 @@ def _capture(
     if _is_symlink_or_junction(output_path.parent) or not output_path.parent.is_dir():
         raise ValueError("price evidence destination is unavailable")
     evidence = capture_price_evidence(fetch=fetch, now=now)
-    atomic_write_json(output_path, evidence.to_dict())
+    _exclusive_atomic_write_json(output_path, evidence.to_dict())
     return evidence
 
 

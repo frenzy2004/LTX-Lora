@@ -153,12 +153,24 @@ RATE_FORMULA_PATTERN = re.compile(
     r"\s*\*\s*steps\b",
     re.IGNORECASE | re.ASCII,
 )
+RATE_PER_STEP_AFTER_PATTERN = re.compile(
+    r"(?<![0-9.])\$?(?P<rate>[0-9]+\.[0-9]+)(?![0-9.])"
+    r"\s*(?:USD\s*)?(?:/\s*steps?\b|per\s+(?:training\s+)?steps?\b)",
+    re.IGNORECASE | re.ASCII,
+)
+RATE_PER_STEP_BEFORE_PATTERN = re.compile(
+    r"\bper\s+(?:training\s+)?step\b\s*"
+    r"(?:(?:rate|price|costs?)\s*)?(?:is\s*|[:=]\s*)?"
+    r"(?<![0-9.])\$?(?P<rate>[0-9]+\.[0-9]+)(?![0-9]|\.[0-9])",
+    re.IGNORECASE | re.ASCII,
+)
 COST_AFTER_STEPS_PATTERN = re.compile(
     r"\b1,?000\s+steps\b.{0,80}?\$(?P<cost>[0-9]+\.[0-9]+)",
     re.IGNORECASE | re.ASCII | re.DOTALL,
 )
 COST_BEFORE_STEPS_PATTERN = re.compile(
     r"\$(?P<cost>[0-9]+\.[0-9]+)(?![0-9.])(?!\s*\*\s*steps)"
+    r"(?!\s*(?:USD\s*)?(?:/\s*|per\s+(?:training\s+)?)steps?\b)"
     r".{0,80}?\b(?:for\s+)?1,?000\s+steps\b",
     re.IGNORECASE | re.ASCII | re.DOTALL,
 )
@@ -284,9 +296,19 @@ def _validate_validation_entries(value: Any) -> list[dict[str, Any]]:
         entries,
         key=lambda entry: (entry["image_filename"], entry["audio_filename"]),
     )
-    image_names = {entry["image_filename"] for entry in entries}
-    audio_names = {entry["audio_filename"] for entry in entries}
-    if entries != canonical_entries or len(image_names) != 2 or len(audio_names) != 2:
+    image_names = [entry["image_filename"] for entry in entries]
+    audio_names = [entry["audio_filename"] for entry in entries]
+    if len(set(image_names)) != 2 or len(set(audio_names)) != 2:
+        raise ValueError("execution configuration requires canonical validation order")
+    if len({name.casefold() for name in image_names}) != 2:
+        raise ValueError(
+            "validation image filenames must be case-insensitively unique"
+        )
+    if len({name.casefold() for name in audio_names}) != 2:
+        raise ValueError(
+            "validation audio filenames must be case-insensitively unique"
+        )
+    if entries != canonical_entries:
         raise ValueError("execution configuration requires canonical validation order")
     return entries
 
@@ -526,12 +548,21 @@ def _verify_price_statement(content: bytes) -> None:
     except UnicodeDecodeError as exc:
         raise ValueError("official price response must be UTF-8") from exc
     contexts = _a2v_price_contexts(text)
-    rates = {
+    formula_rates = {
         match.group("rate")
         for context in contexts
         for match in RATE_FORMULA_PATTERN.finditer(context)
     }
-    if rates != {A2V_RATE_USD_PER_STEP}:
+    explicit_rates = formula_rates | {
+        match.group("rate")
+        for context in contexts
+        for pattern in (RATE_PER_STEP_AFTER_PATTERN, RATE_PER_STEP_BEFORE_PATTERN)
+        for match in pattern.finditer(context)
+    }
+    if (
+        formula_rates != {A2V_RATE_USD_PER_STEP}
+        or explicit_rates != {A2V_RATE_USD_PER_STEP}
+    ):
         raise ValueError("unexpected A2V rate")
     costs = {
         match.group("cost")

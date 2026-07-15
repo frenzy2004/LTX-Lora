@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import stat
+import tempfile
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-from ltx_lora_pilot.artifacts import atomic_write_json, sha256_file
+from ltx_lora_pilot.artifacts import canonical_json_bytes, sha256_file
 from ltx_lora_pilot.authorization import (
     A2V_ENDPOINT,
     A2V_EXECUTIONS,
@@ -47,6 +50,30 @@ def _require_new_output(path: Path) -> None:
         raise ValueError("authorization destination is unavailable")
 
 
+def _exclusive_atomic_write_json(path: Path, value: Any) -> None:
+    content = canonical_json_bytes(value)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as output:
+            temporary_path = Path(output.name)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError as exc:
+            raise ValueError("authorization destination already exists") from exc
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def _record(
     source_file: Path,
     output: Path,
@@ -74,7 +101,7 @@ def _record(
         },
         now=now,
     )
-    atomic_write_json(output_path, policy.to_dict())
+    _exclusive_atomic_write_json(output_path, policy.to_dict())
     return policy
 
 
