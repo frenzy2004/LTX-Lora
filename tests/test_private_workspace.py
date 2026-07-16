@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,8 @@ import pytest
 import ltx_lora_pilot.private_workspace as private_workspace
 from ltx_lora_pilot.private_workspace import (
     approved_private_root_from_environment,
+    canonical_new_run_dir,
+    require_canonical_private_file,
     require_canonical_run_dir,
     resolve_pilot_ledger,
 )
@@ -145,6 +148,40 @@ def test_run_resolution_requires_exact_canonical_layout(
         EXECUTION_ID,
         run_dir,
     ) == run_dir.resolve(strict=True)
+
+
+def test_canonical_new_run_dir_rejects_an_existing_or_aliased_target(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "private-root"
+    runs = private_root / "pilots" / PILOT_ID / "runs"
+    runs.mkdir(parents=True)
+
+    target = canonical_new_run_dir(private_root, PILOT_ID, EXECUTION_ID)
+    assert target == runs / EXECUTION_ID
+
+    target.mkdir()
+    with pytest.raises(ValueError):
+        canonical_new_run_dir(private_root, PILOT_ID, EXECUTION_ID)
+
+
+def test_require_canonical_private_file_requires_a_single_link_root_child(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "private-root"
+    source = private_root / "controls" / "price.json"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"canonical private input")
+
+    assert require_canonical_private_file(private_root, source) == source.resolve(strict=True)
+
+    with pytest.raises(ValueError):
+        require_canonical_private_file(private_root, Path("relative.json"))
+
+    alias = private_root / "controls" / "price-alias.json"
+    os.link(source, alias)
+    with pytest.raises(ValueError):
+        require_canonical_private_file(private_root, alias)
 
 
 @pytest.mark.parametrize(

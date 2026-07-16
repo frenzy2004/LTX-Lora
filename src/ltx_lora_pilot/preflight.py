@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ctypes
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -131,6 +132,13 @@ class PreflightNotReady(RuntimeError):
     pass
 
 
+class _StaticGateFailure(RuntimeError):
+    def __init__(self, gate: str, passed_gates: tuple[str, ...]) -> None:
+        super().__init__(gate)
+        self.gate = gate
+        self.passed_gates = passed_gates
+
+
 @dataclass(frozen=True)
 class PreflightStatus:
     schema_version: str
@@ -186,6 +194,28 @@ class PreflightStatus:
 
 
 @dataclass(frozen=True)
+class StaticA2VBundle:
+    """Detached immutable-provenance snapshot of a canonical A2V bundle."""
+
+    private_root: Path
+    run_dir: Path
+    pilot_id: str
+    execution_id: str
+    bundle_id: str
+    root_manifest: dict[str, Any]
+    structural_report: dict[str, Any]
+    quality_attestation: dict[str, Any]
+    dataset_manifest: dict[str, Any]
+    provider_selection: dict[str, Any]
+    execution_config: dict[str, Any]
+    price_evidence: dict[str, Any]
+    standing_policy: dict[str, Any]
+    quality_summary: dict[str, Any]
+    archive_digest: FileDigest
+    passed_gates: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _NodeFingerprint:
     device: int
     inode: int
@@ -211,8 +241,10 @@ class _OpenPinnedArchive:
     digest: FileDigest
 
     def close(self) -> None:
-        self.archive.close()
-        self.source.close()
+        try:
+            self.archive.close()
+        finally:
+            self.source.close()
 
 
 @dataclass(frozen=True)
@@ -235,6 +267,22 @@ class _PathContext:
     pilot_id: str
     execution_id: str
     security_snapshot: dict[str, _NodeFingerprint] = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _StaticVerification:
+    context: _PathContext
+    artifacts: _LoadedArtifacts
+    pins: dict[str, _PinnedFile] = field(repr=False)
+    bundle_id: str
+    archive_digest: FileDigest
+    fresh_structural: dict[str, Any]
+    quality_summary: dict[str, Any]
+    rebuilt_manifest: dict[str, Any]
+    provider_selection: dict[str, Any]
+    config: dict[str, Any]
+    provider_items: int
+    passed_gates: tuple[str, ...]
 
 
 def _node_fingerprint(value: os.stat_result) -> _NodeFingerprint:
@@ -776,9 +824,11 @@ def _safe_archive_structural_validation(
     context: _PathContext,
     artifacts: _LoadedArtifacts,
     opened_archive: _OpenPinnedArchive,
+    *,
+    temporary_parent: Path | None = None,
 ) -> dict[str, Any]:
     run = context.run_dir
-    parent = run / ".preflight-tmp"
+    parent = run / ".preflight-tmp" if temporary_parent is None else Path(temporary_parent)
     parent_created = False
     temporary: Path | None = None
     try:
@@ -786,7 +836,11 @@ def _safe_archive_structural_validation(
             metadata = _protected_metadata(parent)
             if not stat.S_ISDIR(metadata.st_mode):
                 raise ValueError("preflight temporary parent is invalid")
+            if temporary_parent is not None and any(parent.iterdir()):
+                raise ValueError("preflight temporary parent is not empty")
         else:
+            if temporary_parent is not None:
+                raise ValueError("preflight temporary parent is unavailable")
             parent.mkdir(mode=0o700)
             parent_created = True
             if os.name != "nt":
@@ -843,6 +897,41 @@ def _safe_archive_structural_validation(
             parent.rmdir()
 
 
+def _create_static_archive_parent(context: _PathContext) -> tuple[Path, _NodeFingerprint]:
+    try:
+        parent = Path(tempfile.mkdtemp(prefix=".a2v-static-", dir=context.private_root))
+    except OSError as exc:
+        raise ValueError("static archive temporary parent is unavailable") from exc
+    try:
+        metadata = _protected_metadata(parent)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("static archive temporary parent is invalid")
+        return parent, _node_fingerprint(metadata)
+    except Exception:
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
+        raise
+
+
+def _remove_static_archive_parent(parent: Path, fingerprint: _NodeFingerprint) -> None:
+    try:
+        metadata = _protected_metadata(parent)
+    except Exception:
+        raise ValueError("static archive temporary parent changed") from None
+    if _node_fingerprint(metadata) != fingerprint:
+        raise ValueError("static archive temporary parent changed")
+    try:
+        if any(parent.iterdir()):
+            raise ValueError("static archive temporary parent changed")
+        parent.rmdir()
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError("static archive temporary parent changed") from exc
+
+
 def _candidate_structural_rerun(
     context: _PathContext,
     artifacts: _LoadedArtifacts,
@@ -880,6 +969,198 @@ def _validate_request_allowlist(
     if root.get("execution_id") != context.execution_id:
         raise ValueError("root execution identity mismatch")
     return config
+
+
+def _verify_static_gates(
+    context: _PathContext,
+    expected_bundle_id: str,
+    *,
+    require_receipt: bool,
+    archive_temporary_parent: Path | None = None,
+) -> _StaticVerification:
+    """Run the integrity-only prefix of preflight in its public gate order."""
+
+    passed: list[str] = []
+    opened_archive: _OpenPinnedArchive | None = None
+    try:
+        try:
+            artifacts = _load_canonical_artifacts(context, require_receipt)
+        except Exception:
+            raise _StaticGateFailure("canonical_artifacts", tuple(passed)) from None
+        passed.append("canonical_artifacts")
+
+        try:
+            if SHA256_PATTERN.fullmatch(expected_bundle_id) is None:
+                raise ValueError("confirmed bundle ID is invalid")
+            bundle_id = compute_bundle_id(artifacts.root_manifest)
+            if bundle_id != expected_bundle_id:
+                raise ValueError("confirmed bundle ID mismatch")
+        except Exception:
+            raise _StaticGateFailure("bundle_id", tuple(passed)) from None
+        passed.append("bundle_id")
+
+        try:
+            pins = _pin_root_artifacts(context, artifacts, require_receipt)
+        except Exception:
+            raise _StaticGateFailure("root_artifact_hashes", tuple(passed)) from None
+        passed.append("root_artifact_hashes")
+
+        try:
+            opened_archive = _open_inspected_archive(
+                pins["training_archive"],
+                _expected_archive_members(artifacts.dataset_manifest),
+            )
+            archive_digest = opened_archive.digest
+        except Exception:
+            raise _StaticGateFailure("archive_inspection", tuple(passed)) from None
+        passed.append("archive_inspection")
+
+        try:
+            _safe_archive_structural_validation(
+                context,
+                artifacts,
+                opened_archive,
+                temporary_parent=archive_temporary_parent,
+            )
+        except Exception:
+            raise _StaticGateFailure("archive_structural_validation", tuple(passed)) from None
+        passed.append("archive_structural_validation")
+
+        try:
+            fresh_structural = _candidate_structural_rerun(context, artifacts)
+        except Exception:
+            raise _StaticGateFailure("candidate_structural_rerun", tuple(passed)) from None
+        passed.append("candidate_structural_rerun")
+
+        try:
+            quality_summary = validate_quality_and_splits(
+                artifacts.quality_attestation,
+                fresh_structural,
+            )
+        except Exception:
+            raise _StaticGateFailure("quality_attestation", tuple(passed)) from None
+        passed.append("quality_attestation")
+
+        try:
+            rebuilt_manifest = build_dataset_manifest(
+                fresh_structural,
+                artifacts.quality_attestation,
+                FileDigest(
+                    name=pins["training_archive"].path.name,
+                    bytes=archive_digest.bytes,
+                    sha256=archive_digest.sha256,
+                ),
+                candidate_dir=context.run_dir / "candidates",
+            )
+            if canonical_json_bytes(rebuilt_manifest) != canonical_json_bytes(
+                artifacts.dataset_manifest
+            ):
+                raise ValueError("dataset manifest is stale")
+            if artifacts.root_manifest.get("holdout_groups") != rebuilt_manifest["groups"]["holdout"]:
+                raise ValueError("root holdout manifest mismatch")
+        except Exception:
+            raise _StaticGateFailure("split_and_manifest", tuple(passed)) from None
+        passed.append("split_and_manifest")
+
+        try:
+            try:
+                validate_execution_config(artifacts.execution_config)
+            except Exception:
+                # Preserve the legacy gate attribution: malformed request fields
+                # are owned by the following request-allowlist gate.
+                items = artifacts.provider_selection.get("items")
+                if type(items) is not list:
+                    raise ValueError("provider validation items are invalid")
+                provider_items = len(items)
+                provider_selection = copy.deepcopy(artifacts.provider_selection)
+            else:
+                provider_selection = validate_provider_validation_selection(
+                    artifacts.provider_selection,
+                    fresh_structural,
+                    quality_summary,
+                    artifacts.execution_config,
+                    context.run_dir / "candidates",
+                )
+                provider_items = len(provider_selection["items"])
+        except Exception:
+            raise _StaticGateFailure("provider_validation_selection", tuple(passed)) from None
+        passed.append("provider_validation_selection")
+
+        try:
+            config = _validate_request_allowlist(context, artifacts, pins)
+        except Exception:
+            raise _StaticGateFailure("request_allowlist", tuple(passed)) from None
+        passed.append("request_allowlist")
+
+        return _StaticVerification(
+            context=context,
+            artifacts=artifacts,
+            pins=pins,
+            bundle_id=bundle_id,
+            archive_digest=archive_digest,
+            fresh_structural=fresh_structural,
+            quality_summary=quality_summary,
+            rebuilt_manifest=rebuilt_manifest,
+            provider_selection=provider_selection,
+            config=config,
+            provider_items=provider_items,
+            passed_gates=tuple(passed),
+        )
+    finally:
+        if opened_archive is not None:
+            opened_archive.close()
+
+
+def _public_static_bundle(result: _StaticVerification) -> StaticA2VBundle:
+    return StaticA2VBundle(
+        private_root=result.context.private_root,
+        run_dir=result.context.run_dir,
+        pilot_id=result.context.pilot_id,
+        execution_id=result.context.execution_id,
+        bundle_id=result.bundle_id,
+        root_manifest=copy.deepcopy(result.artifacts.root_manifest),
+        structural_report=copy.deepcopy(result.fresh_structural),
+        quality_attestation=copy.deepcopy(result.artifacts.quality_attestation),
+        dataset_manifest=copy.deepcopy(result.rebuilt_manifest),
+        provider_selection=copy.deepcopy(result.provider_selection),
+        execution_config=copy.deepcopy(result.config),
+        price_evidence=copy.deepcopy(result.artifacts.price_evidence),
+        standing_policy=copy.deepcopy(result.artifacts.standing_policy),
+        quality_summary=copy.deepcopy(result.quality_summary),
+        archive_digest=FileDigest(
+            name=result.archive_digest.name,
+            bytes=result.archive_digest.bytes,
+            sha256=result.archive_digest.sha256,
+        ),
+        passed_gates=result.passed_gates,
+    )
+
+
+def verify_static_a2v_bundle(
+    private_root: Path,
+    run_dir: Path,
+    expected_bundle_id: str,
+) -> StaticA2VBundle:
+    """Verify static source provenance without treating it as live authority."""
+
+    try:
+        context = _lexical_context(Path(private_root), Path(run_dir))
+    except Exception:
+        raise ValueError("canonical private source run is required") from None
+    temporary_parent, fingerprint = _create_static_archive_parent(context)
+    try:
+        try:
+            result = _verify_static_gates(
+                context,
+                expected_bundle_id,
+                require_receipt=False,
+                archive_temporary_parent=temporary_parent,
+            )
+        except _StaticGateFailure as exc:
+            raise ValueError(f"static A2V bundle failed at {exc.gate}") from None
+        return _public_static_bundle(result)
+    finally:
+        _remove_static_archive_parent(temporary_parent, fingerprint)
 
 
 def _parse_expiry(value: Any) -> datetime:
@@ -1073,113 +1354,22 @@ def run_preflight(
     passed.append("private_root")
 
     try:
-        artifacts = _load_canonical_artifacts(context, require_receipt)
-    except Exception:
-        return finish("canonical_artifacts")
-    passed.append("canonical_artifacts")
-
-    try:
-        if SHA256_PATTERN.fullmatch(public_bundle_id) is None:
-            raise ValueError("confirmed bundle ID is invalid")
-        computed_bundle_id = compute_bundle_id(artifacts.root_manifest)
-        if computed_bundle_id != public_bundle_id:
-            raise ValueError("confirmed bundle ID mismatch")
-    except Exception:
-        return finish("bundle_id")
-    passed.append("bundle_id")
-
-    try:
-        pins = _pin_root_artifacts(context, artifacts, require_receipt)
-    except Exception:
-        return finish("root_artifact_hashes")
-    passed.append("root_artifact_hashes")
-
-    try:
-        opened_archive = _open_inspected_archive(
-            pins["training_archive"],
-            _expected_archive_members(artifacts.dataset_manifest),
-        )
-        archive_digest = opened_archive.digest
-    except Exception:
-        return finish("archive_inspection")
-    passed.append("archive_inspection")
-
-    try:
-        _safe_archive_structural_validation(
+        static = _verify_static_gates(
             context,
-            artifacts,
-            opened_archive,
+            public_bundle_id,
+            require_receipt=require_receipt,
         )
-    except Exception:
-        return finish("archive_structural_validation")
-    passed.append("archive_structural_validation")
-
-    try:
-        fresh_structural = _candidate_structural_rerun(context, artifacts)
-    except Exception:
-        return finish("candidate_structural_rerun")
-    passed.append("candidate_structural_rerun")
-
-    try:
-        quality_summary = validate_quality_and_splits(
-            artifacts.quality_attestation,
-            fresh_structural,
-        )
-        training_groups = quality_summary["coverage_counts"]["accepted_train_groups"]
-        holdout_groups = quality_summary["coverage_counts"]["accepted_holdout_groups"]
-    except Exception:
-        return finish("quality_attestation")
-    passed.append("quality_attestation")
-
-    try:
-        rebuilt_manifest = build_dataset_manifest(
-            fresh_structural,
-            artifacts.quality_attestation,
-            FileDigest(
-                name=pins["training_archive"].path.name,
-                bytes=archive_digest.bytes,
-                sha256=archive_digest.sha256,
-            ),
-            candidate_dir=context.run_dir / "candidates",
-        )
-        if canonical_json_bytes(rebuilt_manifest) != canonical_json_bytes(artifacts.dataset_manifest):
-            raise ValueError("dataset manifest is stale")
-        if artifacts.root_manifest.get("holdout_groups") != rebuilt_manifest["groups"]["holdout"]:
-            raise ValueError("root holdout manifest mismatch")
-    except Exception:
-        return finish("split_and_manifest")
-    passed.append("split_and_manifest")
-
-    try:
-        try:
-            validate_execution_config(artifacts.execution_config)
-        except Exception:
-            # The selection validator intentionally consumes the exact request
-            # validator. Preserve the owning gate for a malformed request; the
-            # paid boundary remains closed at the immediately following gate.
-            items = artifacts.provider_selection.get("items")
-            if type(items) is not list:
-                raise ValueError("provider validation items are invalid")
-            provider_items = len(items)
-        else:
-            validated_selection = validate_provider_validation_selection(
-                artifacts.provider_selection,
-                fresh_structural,
-                quality_summary,
-                artifacts.execution_config,
-                context.run_dir / "candidates",
-            )
-            provider_items = len(validated_selection["items"])
-    except Exception:
-        return finish("provider_validation_selection")
-    passed.append("provider_validation_selection")
-
-    try:
-        config = _validate_request_allowlist(context, artifacts, pins)
-        ledger_id = config["ledger_id"]
-    except Exception:
-        return finish("request_allowlist")
-    passed.append("request_allowlist")
+    except _StaticGateFailure as exc:
+        passed.extend(exc.passed_gates)
+        return finish(exc.gate)
+    artifacts = static.artifacts
+    pins = static.pins
+    config = static.config
+    training_groups = static.quality_summary["coverage_counts"]["accepted_train_groups"]
+    holdout_groups = static.quality_summary["coverage_counts"]["accepted_holdout_groups"]
+    provider_items = static.provider_items
+    ledger_id = config["ledger_id"]
+    passed.extend(static.passed_gates)
 
     try:
         price = PriceEvidence.from_dict(artifacts.price_evidence, now=_clock_read(clock))
