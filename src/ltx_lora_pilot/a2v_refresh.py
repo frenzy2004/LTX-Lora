@@ -23,6 +23,10 @@ class SourceRunSnapshot:
     quality_attestation: dict[str, Any]
     quality_summary: dict[str, Any]
     source_config: dict[str, Any]
+    private_root: Path | None = None
+    pilot_id: str | None = None
+    execution_id: str | None = None
+    bundle_id: str | None = None
 
 
 def _require_dataset_contract(
@@ -236,6 +240,52 @@ def _snapshot_copy_inputs(
     return structural, attestation, source_config, expected_names
 
 
+def _reverify_snapshot_for_copy(snapshot: SourceRunSnapshot) -> SourceRunSnapshot:
+    """Reject caller-provided snapshots that no longer match sealed source state."""
+
+    if not isinstance(snapshot, SourceRunSnapshot):
+        raise ValueError("source snapshot is invalid")
+    if (
+        not isinstance(snapshot.private_root, Path)
+        or type(snapshot.pilot_id) is not str
+        or type(snapshot.execution_id) is not str
+        or type(snapshot.bundle_id) is not str
+        or not isinstance(snapshot.run_dir, Path)
+    ):
+        raise ValueError("source snapshot lacks verified source context")
+    try:
+        supplied_run = _require_canonical_source_run(snapshot.run_dir)
+        refreshed = verify_source_run_static(
+            private_root=snapshot.private_root,
+            pilot_id=snapshot.pilot_id,
+            source_execution_id=snapshot.execution_id,
+            expected_source_bundle_id=snapshot.bundle_id,
+        )
+        if (
+            str(supplied_run) != str(refreshed.run_dir)
+            or str(snapshot.private_root) != str(refreshed.private_root)
+            or snapshot.pilot_id != refreshed.pilot_id
+            or snapshot.execution_id != refreshed.execution_id
+            or snapshot.bundle_id != refreshed.bundle_id
+        ):
+            raise ValueError("source snapshot identity changed")
+        for field_name in (
+            "structural_report",
+            "quality_attestation",
+            "quality_summary",
+            "source_config",
+        ):
+            if canonical_json_bytes(getattr(snapshot, field_name)) != canonical_json_bytes(
+                getattr(refreshed, field_name)
+            ):
+                raise ValueError("source snapshot artifacts changed")
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("source snapshot static verification failed") from None
+    return refreshed
+
+
 def verify_source_run_static(
     *,
     private_root: Path,
@@ -264,6 +314,10 @@ def verify_source_run_static(
         quality_attestation=copy.deepcopy(bundle.quality_attestation),
         quality_summary=copy.deepcopy(bundle.quality_summary),
         source_config=copy.deepcopy(bundle.execution_config),
+        private_root=bundle.private_root,
+        pilot_id=bundle.pilot_id,
+        execution_id=bundle.execution_id,
+        bundle_id=bundle.bundle_id,
     )
 
 
@@ -275,8 +329,9 @@ def copy_accepted_candidates(
 
     if not isinstance(snapshot, SourceRunSnapshot):
         raise ValueError("source snapshot is invalid")
-    source_run = _require_canonical_source_run(snapshot.run_dir)
-    structural, attestation, source_config, expected_names = _snapshot_copy_inputs(snapshot)
+    refreshed = _reverify_snapshot_for_copy(snapshot)
+    source_run = _require_canonical_source_run(refreshed.run_dir)
+    structural, attestation, source_config, expected_names = _snapshot_copy_inputs(refreshed)
     target = _prepare_empty_destination(destination, prohibited_root=source_run)
     source_dir = source_run / "candidates"
     if _is_reparse_or_link(source_dir) or not source_dir.is_dir():
@@ -324,6 +379,6 @@ def copy_accepted_candidates(
     if canonical_json_bytes(copied_structural) != canonical_json_bytes(structural):
         raise ValueError("copied candidate structural report changed")
     copied_summary = validate_quality_and_splits(attestation, copied_structural)
-    if canonical_json_bytes(copied_summary) != canonical_json_bytes(snapshot.quality_summary):
+    if canonical_json_bytes(copied_summary) != canonical_json_bytes(refreshed.quality_summary):
         raise ValueError("copied candidate quality split changed")
     return copy.deepcopy(copied_structural), copy.deepcopy(attestation)

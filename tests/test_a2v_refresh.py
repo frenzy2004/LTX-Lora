@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import os
 from pathlib import Path
@@ -480,6 +480,30 @@ def test_copy_accepted_candidates_rejects_a_destination_within_the_source_run(
         copy_accepted_candidates(snapshot, forbidden_target)
 
     assert not forbidden_target.exists()
+
+
+def test_copy_accepted_candidates_rejects_a_forged_external_snapshot_without_writing(
+    ready_source_run: ReadySourceRun,
+    tmp_path: Path,
+) -> None:
+    verified = verify_source_run_static(
+        private_root=ready_source_run.private_root,
+        pilot_id=ready_source_run.pilot_id,
+        source_execution_id=ready_source_run.execution_id,
+        expected_source_bundle_id=ready_source_run.bundle_id,
+    )
+    external_run = tmp_path / "unverified-external-run"
+    external_candidates = external_run / "candidates"
+    external_candidates.mkdir(parents=True)
+    for source in ready_source_run.candidate_paths:
+        (external_candidates / source.name).write_bytes(source.read_bytes())
+    forged = replace(verified, run_dir=external_run)
+    destination = tmp_path / "staging" / "candidates"
+
+    with pytest.raises(ValueError):
+        copy_accepted_candidates(forged, destination)
+
+    assert not destination.exists()
 
 
 def test_copy_accepted_candidates_rejects_a_source_run_ancestor_alias(
