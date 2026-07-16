@@ -9,7 +9,7 @@ import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, BinaryIO, Iterable, Mapping
 
 from .a2v_quality import validate_quality_and_splits
 from .artifacts import (
@@ -303,135 +303,143 @@ def _inspect_canonical_zip_layout(
     infos: list[zipfile.ZipInfo],
 ) -> None:
     with archive_path.open("rb") as source:
-        archive_size = os.fstat(source.fileno()).st_size
-        if archive_size < END_OF_CENTRAL_DIRECTORY.size:
+        _inspect_canonical_zip_layout_stream(source, infos)
+
+
+def _inspect_canonical_zip_layout_stream(
+    source: BinaryIO,
+    infos: list[zipfile.ZipInfo],
+) -> None:
+    source.seek(0, os.SEEK_END)
+    archive_size = source.tell()
+    if archive_size < END_OF_CENTRAL_DIRECTORY.size:
+        raise ValueError("training archive has non-canonical ZIP headers")
+    eocd_offset = archive_size - END_OF_CENTRAL_DIRECTORY.size
+    source.seek(eocd_offset)
+    eocd = END_OF_CENTRAL_DIRECTORY.unpack(
+        _read_exact(source, END_OF_CENTRAL_DIRECTORY.size)
+    )
+    if eocd[0] != END_OF_CENTRAL_DIRECTORY_SIGNATURE:
+        raise ValueError("training archive contains a hidden trailing payload")
+    (
+        _,
+        disk_number,
+        central_disk,
+        disk_entries,
+        total_entries,
+        central_size,
+        central_offset,
+        comment_length,
+    ) = eocd
+    if (
+        disk_number != 0
+        or central_disk != 0
+        or disk_entries != len(infos)
+        or total_entries != len(infos)
+        or comment_length != 0
+        or central_offset + central_size != eocd_offset
+    ):
+        raise ValueError("training archive has non-canonical ZIP headers")
+
+    cursor = 0
+    for info in infos:
+        if info.header_offset != cursor:
             raise ValueError("training archive has non-canonical ZIP headers")
-        eocd_offset = archive_size - END_OF_CENTRAL_DIRECTORY.size
-        source.seek(eocd_offset)
-        eocd = END_OF_CENTRAL_DIRECTORY.unpack(
-            _read_exact(source, END_OF_CENTRAL_DIRECTORY.size)
+        source.seek(cursor)
+        local = LOCAL_FILE_HEADER.unpack(
+            _read_exact(source, LOCAL_FILE_HEADER.size)
         )
-        if eocd[0] != END_OF_CENTRAL_DIRECTORY_SIGNATURE:
-            raise ValueError("training archive contains a hidden trailing payload")
         (
-            _,
-            disk_number,
-            central_disk,
-            disk_entries,
-            total_entries,
-            central_size,
-            central_offset,
-            comment_length,
-        ) = eocd
+            signature,
+            extract_version,
+            flags,
+            compression,
+            modified_time,
+            modified_date,
+            crc,
+            compressed_size,
+            uncompressed_size,
+            name_length,
+            extra_length,
+        ) = local
+        raw_name = _read_exact(source, name_length)
+        raw_extra = _read_exact(source, extra_length)
+        expected_name = info.filename.encode("ascii")
         if (
-            disk_number != 0
-            or central_disk != 0
-            or disk_entries != len(infos)
-            or total_entries != len(infos)
-            or comment_length != 0
-            or central_offset + central_size != eocd_offset
+            signature != LOCAL_FILE_SIGNATURE
+            or extract_version != CANONICAL_ZIP_VERSION
+            or flags != 0
+            or compression != zipfile.ZIP_STORED
+            or modified_time != CANONICAL_DOS_TIME
+            or modified_date != CANONICAL_DOS_DATE
+            or crc != info.CRC
+            or compressed_size != info.compress_size
+            or uncompressed_size != info.file_size
+            or raw_name != expected_name
+            or raw_extra
         ):
             raise ValueError("training archive has non-canonical ZIP headers")
+        cursor += LOCAL_FILE_HEADER.size + name_length + extra_length + compressed_size
+    if cursor != central_offset:
+        raise ValueError("training archive has non-canonical ZIP headers")
 
-        cursor = 0
-        for info in infos:
-            if info.header_offset != cursor:
-                raise ValueError("training archive has non-canonical ZIP headers")
-            source.seek(cursor)
-            local = LOCAL_FILE_HEADER.unpack(
-                _read_exact(source, LOCAL_FILE_HEADER.size)
-            )
-            (
-                signature,
-                extract_version,
-                flags,
-                compression,
-                modified_time,
-                modified_date,
-                crc,
-                compressed_size,
-                uncompressed_size,
-                name_length,
-                extra_length,
-            ) = local
-            raw_name = _read_exact(source, name_length)
-            raw_extra = _read_exact(source, extra_length)
-            expected_name = info.filename.encode("ascii")
-            if (
-                signature != LOCAL_FILE_SIGNATURE
-                or extract_version != CANONICAL_ZIP_VERSION
-                or flags != 0
-                or compression != zipfile.ZIP_STORED
-                or modified_time != CANONICAL_DOS_TIME
-                or modified_date != CANONICAL_DOS_DATE
-                or crc != info.CRC
-                or compressed_size != info.compress_size
-                or uncompressed_size != info.file_size
-                or raw_name != expected_name
-                or raw_extra
-            ):
-                raise ValueError("training archive has non-canonical ZIP headers")
-            cursor += LOCAL_FILE_HEADER.size + name_length + extra_length + compressed_size
-        if cursor != central_offset:
+    cursor = central_offset
+    for info in infos:
+        source.seek(cursor)
+        central = CENTRAL_DIRECTORY_HEADER.unpack(
+            _read_exact(source, CENTRAL_DIRECTORY_HEADER.size)
+        )
+        (
+            signature,
+            made_by,
+            extract_version,
+            flags,
+            compression,
+            modified_time,
+            modified_date,
+            crc,
+            compressed_size,
+            uncompressed_size,
+            name_length,
+            extra_length,
+            member_comment_length,
+            start_disk,
+            internal_attr,
+            external_attr,
+            local_offset,
+        ) = central
+        raw_name = _read_exact(source, name_length)
+        raw_extra = _read_exact(source, extra_length)
+        raw_comment = _read_exact(source, member_comment_length)
+        expected_name = info.filename.encode("ascii")
+        if (
+            signature != CENTRAL_DIRECTORY_SIGNATURE
+            or made_by != CANONICAL_ZIP_MADE_BY
+            or extract_version != CANONICAL_ZIP_VERSION
+            or flags != 0
+            or compression != zipfile.ZIP_STORED
+            or modified_time != CANONICAL_DOS_TIME
+            or modified_date != CANONICAL_DOS_DATE
+            or crc != info.CRC
+            or compressed_size != info.compress_size
+            or uncompressed_size != info.file_size
+            or raw_name != expected_name
+            or raw_extra
+            or raw_comment
+            or start_disk != 0
+            or internal_attr != 0
+            or external_attr != FIXED_EXTERNAL_ATTR
+            or local_offset != info.header_offset
+        ):
             raise ValueError("training archive has non-canonical ZIP headers")
-
-        cursor = central_offset
-        for info in infos:
-            source.seek(cursor)
-            central = CENTRAL_DIRECTORY_HEADER.unpack(
-                _read_exact(source, CENTRAL_DIRECTORY_HEADER.size)
-            )
-            (
-                signature,
-                made_by,
-                extract_version,
-                flags,
-                compression,
-                modified_time,
-                modified_date,
-                crc,
-                compressed_size,
-                uncompressed_size,
-                name_length,
-                extra_length,
-                member_comment_length,
-                start_disk,
-                internal_attr,
-                external_attr,
-                local_offset,
-            ) = central
-            raw_name = _read_exact(source, name_length)
-            raw_extra = _read_exact(source, extra_length)
-            raw_comment = _read_exact(source, member_comment_length)
-            expected_name = info.filename.encode("ascii")
-            if (
-                signature != CENTRAL_DIRECTORY_SIGNATURE
-                or made_by != CANONICAL_ZIP_MADE_BY
-                or extract_version != CANONICAL_ZIP_VERSION
-                or flags != 0
-                or compression != zipfile.ZIP_STORED
-                or modified_time != CANONICAL_DOS_TIME
-                or modified_date != CANONICAL_DOS_DATE
-                or crc != info.CRC
-                or compressed_size != info.compress_size
-                or uncompressed_size != info.file_size
-                or raw_name != expected_name
-                or raw_extra
-                or raw_comment
-                or start_disk != 0
-                or internal_attr != 0
-                or external_attr != FIXED_EXTERNAL_ATTR
-                or local_offset != info.header_offset
-            ):
-                raise ValueError("training archive has non-canonical ZIP headers")
-            cursor += (
-                CENTRAL_DIRECTORY_HEADER.size
-                + name_length
-                + extra_length
-                + member_comment_length
-            )
-        if cursor != central_offset + central_size or cursor != eocd_offset:
-            raise ValueError("training archive has non-canonical ZIP headers")
+        cursor += (
+            CENTRAL_DIRECTORY_HEADER.size
+            + name_length
+            + extra_length
+            + member_comment_length
+        )
+    if cursor != central_offset + central_size or cursor != eocd_offset:
+        raise ValueError("training archive has non-canonical ZIP headers")
 
 
 def _write_source_member(
@@ -562,7 +570,50 @@ def inspect_training_archive(
     max_uncompressed_bytes: int = MAX_ARCHIVE_UNCOMPRESSED_BYTES,
     max_compression_ratio: int = MAX_ARCHIVE_COMPRESSION_RATIO,
 ) -> FileDigest:
-    """Inspect metadata first, then verify every member against its manifest."""
+    """Inspect one path-opened archive object against its manifest."""
+
+    archive_path = Path(archive_path)
+    try:
+        with archive_path.open("rb") as source:
+            with zipfile.ZipFile(source, mode="r") as archive:
+                return inspect_open_training_archive(
+                    archive,
+                    expected_members,
+                    name=archive_path.name,
+                    max_members=max_members,
+                    max_uncompressed_bytes=max_uncompressed_bytes,
+                    max_compression_ratio=max_compression_ratio,
+                )
+    except ValueError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        raise ValueError("training archive is invalid") from exc
+
+
+def _sha256_open_file(source: BinaryIO, *, name: str) -> FileDigest:
+    position = source.tell()
+    digest = hashlib.sha256()
+    byte_count = 0
+    try:
+        source.seek(0)
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+            byte_count += len(chunk)
+    finally:
+        source.seek(position)
+    return FileDigest(name=name, bytes=byte_count, sha256=digest.hexdigest())
+
+
+def inspect_open_training_archive(
+    archive: zipfile.ZipFile,
+    expected_members: Iterable[Mapping[str, Any]] | Mapping[str, Mapping[str, Any]],
+    *,
+    name: str,
+    max_members: int = MAX_ARCHIVE_MEMBERS,
+    max_uncompressed_bytes: int = MAX_ARCHIVE_UNCOMPRESSED_BYTES,
+    max_compression_ratio: int = MAX_ARCHIVE_COMPRESSION_RATIO,
+) -> FileDigest:
+    """Inspect metadata and payloads through one retained ZIP/file object."""
 
     if type(max_members) is not int or max_members <= 0:
         raise ValueError("archive member-count limit must be a positive integer")
@@ -571,100 +622,101 @@ def inspect_training_archive(
     if type(max_compression_ratio) is not int or max_compression_ratio <= 0:
         raise ValueError("archive compression-ratio limit must be a positive integer")
     expected = _normalize_expected_members(expected_members)
-    archive_path = Path(archive_path)
+    source = archive.fp
+    if source is None or not source.seekable() or not source.readable():
+        raise ValueError("training archive requires one retained readable file object")
 
     try:
-        with zipfile.ZipFile(archive_path, mode="r") as archive:
-            if archive.comment:
+        if archive.comment:
+            raise ValueError("training archive contains prohibited metadata")
+        infos = archive.infolist()
+        if len(infos) > max_members:
+            raise ValueError("training archive exceeds the member-count limit")
+
+        names: list[str] = []
+        seen: set[str] = set()
+        casefolded: set[str] = set()
+        total_size = 0
+        for info in infos:
+            if (
+                type(info.orig_filename) is not str
+                or "\x00" in info.orig_filename
+                or info.orig_filename != info.filename
+            ):
+                raise ValueError("training archive contains an invalid raw member name")
+            _validate_member_name(info.orig_filename)
+            member_name = _validate_member_name(info.filename)
+            if member_name in seen:
+                raise ValueError("training archive contains duplicate member names")
+            folded = member_name.casefold()
+            if folded in casefolded:
+                raise ValueError("training archive contains case-colliding member names")
+            seen.add(member_name)
+            casefolded.add(folded)
+            names.append(member_name)
+
+            if info.flag_bits & 0x1:
+                raise ValueError("training archive member encryption is prohibited")
+            if info.flag_bits != 0:
+                raise ValueError("training archive has non-canonical ZIP headers")
+            if info.is_dir():
+                raise ValueError("training archive members require regular-file attributes")
+            unix_mode = info.external_attr >> 16
+            if (
+                info.create_system != 3
+                or not stat.S_ISREG(unix_mode)
+                or info.external_attr != FIXED_EXTERNAL_ATTR
+            ):
+                raise ValueError("training archive members require regular-file attributes")
+            if info.file_size < 0 or info.compress_size < 0:
+                raise ValueError("training archive contains invalid member sizes")
+            total_size += info.file_size
+            if total_size > max_uncompressed_bytes:
+                raise ValueError("training archive exceeds the uncompressed-size limit")
+            if info.file_size > max_compression_ratio * max(1, info.compress_size):
+                raise ValueError("training archive exceeds the compression-ratio limit")
+            if info.compress_type != zipfile.ZIP_STORED:
+                raise ValueError("training archive members must use ZIP_STORED")
+            if info.compress_size != info.file_size:
+                raise ValueError("training archive ZIP_STORED member has unequal stored sizes")
+            if (
+                info.date_time != FIXED_ARCHIVE_DATETIME
+                or info.internal_attr != 0
+                or info.extra
+                or info.comment
+            ):
                 raise ValueError("training archive contains prohibited metadata")
-            infos = archive.infolist()
-            if len(infos) > max_members:
-                raise ValueError("training archive exceeds the member-count limit")
 
-            names: list[str] = []
-            seen: set[str] = set()
-            casefolded: set[str] = set()
-            total_size = 0
-            for info in infos:
-                if (
-                    type(info.orig_filename) is not str
-                    or "\x00" in info.orig_filename
-                    or info.orig_filename != info.filename
-                ):
-                    raise ValueError("training archive contains an invalid raw member name")
-                _validate_member_name(info.orig_filename)
-                name = _validate_member_name(info.filename)
-                if name in seen:
-                    raise ValueError("training archive contains duplicate member names")
-                folded = name.casefold()
-                if folded in casefolded:
-                    raise ValueError("training archive contains case-colliding member names")
-                seen.add(name)
-                casefolded.add(folded)
-                names.append(name)
+        if names != sorted(names):
+            raise ValueError("training archive member order is not lexical")
+        _inspect_canonical_zip_layout_stream(source, infos)
+        unexpected = sorted(set(names) - set(expected))
+        if unexpected:
+            raise ValueError("training archive contains unexpected members")
+        missing = sorted(set(expected) - set(names))
+        if missing:
+            raise ValueError("training archive is missing members")
 
-                if info.flag_bits & 0x1:
-                    raise ValueError("training archive member encryption is prohibited")
-                if info.flag_bits != 0:
-                    raise ValueError("training archive has non-canonical ZIP headers")
-                if info.is_dir():
-                    raise ValueError("training archive members require regular-file attributes")
-                unix_mode = info.external_attr >> 16
-                if (
-                    info.create_system != 3
-                    or not stat.S_ISREG(unix_mode)
-                    or info.external_attr != FIXED_EXTERNAL_ATTR
-                ):
-                    raise ValueError("training archive members require regular-file attributes")
-                if info.file_size < 0 or info.compress_size < 0:
-                    raise ValueError("training archive contains invalid member sizes")
-                total_size += info.file_size
-                if total_size > max_uncompressed_bytes:
-                    raise ValueError("training archive exceeds the uncompressed-size limit")
-                if info.file_size > max_compression_ratio * max(1, info.compress_size):
-                    raise ValueError("training archive exceeds the compression-ratio limit")
-                if info.compress_type != zipfile.ZIP_STORED:
-                    raise ValueError("training archive members must use ZIP_STORED")
-                if info.compress_size != info.file_size:
-                    raise ValueError("training archive ZIP_STORED member has unequal stored sizes")
-                if (
-                    info.date_time != FIXED_ARCHIVE_DATETIME
-                    or info.internal_attr != 0
-                    or info.extra
-                    or info.comment
-                ):
-                    raise ValueError("training archive contains prohibited metadata")
-
-            if names != sorted(names):
-                raise ValueError("training archive member order is not lexical")
-            _inspect_canonical_zip_layout(archive_path, infos)
-            unexpected = sorted(set(names) - set(expected))
-            if unexpected:
-                raise ValueError("training archive contains unexpected members")
-            missing = sorted(set(expected) - set(names))
-            if missing:
-                raise ValueError("training archive is missing members")
-
-            for info in infos:
-                expected_record = expected[info.filename]
-                digest = hashlib.sha256()
-                byte_count = 0
-                with archive.open(info, mode="r") as member:
-                    while chunk := member.read(1024 * 1024):
-                        digest.update(chunk)
-                        byte_count += len(chunk)
-                if (
-                    byte_count != expected_record["bytes"]
-                    or digest.hexdigest() != expected_record["sha256"]
-                ):
-                    raise ValueError(
-                        f"archive member {info.filename} does not match its manifest"
-                    )
+        for info in infos:
+            expected_record = expected[info.filename]
+            digest = hashlib.sha256()
+            byte_count = 0
+            with archive.open(info, mode="r") as member:
+                while chunk := member.read(1024 * 1024):
+                    digest.update(chunk)
+                    byte_count += len(chunk)
+            if (
+                byte_count != expected_record["bytes"]
+                or digest.hexdigest() != expected_record["sha256"]
+            ):
+                raise ValueError(
+                    f"archive member {info.filename} does not match its manifest"
+                )
     except ValueError:
         raise
     except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
         raise ValueError("training archive is invalid") from exc
-    return sha256_file(archive_path)
+    return _sha256_open_file(source, name=name)
 
 
 def _canonical_object_digest(value: Any) -> dict[str, Any]:
