@@ -48,6 +48,8 @@
 - Consumes: `require_canonical_run_dir`, `approved_private_root_from_environment`, `strict_load_json`, `canonical_json_bytes`, `validate_a2v_directory`, `validate_quality_and_splits`, `validate_execution_config`, `compute_bundle_id`.
 - Produces: `canonical_new_run_dir(private_root, pilot_id, execution_id) -> Path`, `require_canonical_private_file(private_root, path) -> Path`, `verify_static_a2v_bundle(private_root, run_dir, expected_bundle_id) -> StaticA2VBundle`, `verify_source_run_static(private_root, pilot_id, source_execution_id, expected_source_bundle_id) -> SourceRunSnapshot`, and `copy_accepted_candidates(snapshot, destination) -> tuple[dict[str, Any], dict[str, Any]]` for later target construction.
 
+`canonical_new_run_dir` intentionally has no source-execution argument because it is a generic absent-destination resolver. Task 2’s `refresh_sealed_a2v_run`, which receives both source and target execution IDs, must reject equality before it derives a target or creates staging. This allocation prevents a generic path helper from receiving unrelated source provenance while still enforcing the global no-reissue-in-place invariant at the first operation that can issue a target.
+
 - [ ] **Step 1: Write the failing source-verification test**
 
 ```python
