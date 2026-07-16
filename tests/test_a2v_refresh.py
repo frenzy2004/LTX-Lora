@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 from typing import Any
 import zipfile
 
@@ -51,6 +53,9 @@ LEDGER_ID = "ledger_00000000000040008000000000000004"
 FRESH_TARGET_EXECUTION_ID = "exec_00000000000040008000000000000006"
 FRESH_CREATED_AT = "2026-07-16T01:00:00Z"
 FRESH_EXPIRES_AT = "2026-07-16T12:00:00Z"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+REFRESH_SCRIPT = REPOSITORY_ROOT / "scripts" / "refresh_a2v_run.py"
+REFRESH_MODULE = REFRESH_SCRIPT
 
 
 @dataclass(frozen=True)
@@ -687,6 +692,112 @@ def _refresh_kwargs(ready_source_run: ReadySourceRun, fresh_controls: FreshContr
         "validation_prompts_path": fresh_controls.prompts_path,
         "repository_commit": "a" * 40,
     }
+
+
+def _refresh_command(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+) -> list[str]:
+    return [
+        sys.executable,
+        str(REFRESH_SCRIPT),
+        "--pilot-id",
+        ready_source_run.pilot_id,
+        "--source-execution-id",
+        ready_source_run.execution_id,
+        "--expected-source-bundle-id",
+        ready_source_run.bundle_id,
+        "--target-execution-id",
+        fresh_controls.target_execution_id,
+        "--created-at-utc",
+        fresh_controls.created_at_utc,
+        "--expires-at-utc",
+        fresh_controls.expires_at_utc,
+        "--price-evidence",
+        str(fresh_controls.price_path),
+        "--standing-authorization",
+        str(fresh_controls.policy_path),
+        "--validation-prompts",
+        str(fresh_controls.prompts_path),
+        "--repository-commit",
+        "a" * 40,
+    ]
+
+
+def _refresh_environment(
+    ready_source_run: ReadySourceRun,
+    tmp_path: Path | None = None,
+) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["LTX_LORA_PRIVATE_ROOT"] = str(ready_source_run.private_root)
+    if tmp_path is not None:
+        shim_dir = tmp_path / "refresh-cli-shim"
+        shim_dir.mkdir()
+        (shim_dir / "sitecustomize.py").write_text(
+            """
+from hashlib import sha256
+from pathlib import Path
+import socket
+import urllib.request
+
+from ltx_lora_pilot import a2v_dataset, authorization, pilot_ledger, preflight
+
+
+def _forbidden(*args, **kwargs):
+    raise AssertionError("fresh issuer crossed an offline authority boundary")
+
+
+def _media_probe(path, **_):
+    name = Path(path).name
+    if name.endswith("_end.mp4"):
+        return {
+            "streams": [{"codec_type": "video", "codec_name": "h264", "width": 544, "height": 960, "avg_frame_rate": "24/1", "r_frame_rate": "24/1", "nb_read_frames": "89", "start_time": "0", "duration": "3.708333", "time_base": "1/24"}],
+            "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "tags": {"major_brand": "isom"}},
+            "frames": [{"media_type": "video", "best_effort_timestamp": str(index)} for index in range(89)],
+        }
+    if name.endswith("_start.png"):
+        return {
+            "streams": [{"codec_type": "video", "codec_name": "png", "pix_fmt": "rgb24", "width": 544, "height": 960}],
+            "format": {"format_name": "png_pipe"},
+        }
+    if name.endswith("_audio.wav"):
+        return {
+            "streams": [{"codec_type": "audio", "codec_name": "pcm_s16le", "sample_fmt": "s16", "channels": 1, "sample_rate": "48000", "start_time": "0", "duration": "3.708333", "time_base": "1/48000"}],
+            "format": {"format_name": "wav"},
+            "packets": [{"codec_type": "audio", "pts": "0"}],
+        }
+    raise AssertionError("unexpected media probe path")
+
+
+def _first_frame_digest(path, **_):
+    name = Path(path).name
+    group_id = name[:-len("_start.png")] if name.endswith("_start.png") else name[:-len("_end.mp4")]
+    return sha256(group_id.encode("ascii")).hexdigest()
+
+
+a2v_dataset._ffprobe = _media_probe
+a2v_dataset._first_frame_sha256 = _first_frame_digest
+a2v_dataset._reject_digital_silence = lambda path: None
+preflight._WINDOWS_DACL_CHECK = lambda path: None
+socket.socket = _forbidden
+socket.create_connection = _forbidden
+urllib.request.urlopen = _forbidden
+authorization._fetch_official_price = _forbidden
+authorization.issue_execution_receipt = _forbidden
+authorization.verify_execution_receipt = _forbidden
+pilot_ledger.PilotLedger.open_existing = _forbidden
+pilot_ledger.PilotLedger.reserve = _forbidden
+pilot_ledger.PilotLedger.reserve_training = _forbidden
+""".lstrip(),
+            encoding="utf-8",
+        )
+        existing = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = (
+            str(shim_dir)
+            if not existing
+            else os.pathsep.join((str(shim_dir), existing))
+        )
+    return environment
 
 
 def _target_run_dir(kwargs: dict[str, Any]) -> Path:
@@ -1576,7 +1687,134 @@ def _install_matching_pilot_ledger(private_root: Path) -> None:
     _secure_tree(private_root)
 
 
-def test_refresh_target_passes_policy_only_preflight(
+def test_refresh_cli_issues_target_and_exposes_no_paid_or_provider_options(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    tmp_path: Path,
+) -> None:
+    completed = subprocess.run(
+        _refresh_command(ready_source_run, fresh_controls),
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        env=_refresh_environment(ready_source_run, tmp_path),
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+    expected = {
+        "status": "issued",
+        "execution_id": fresh_controls.target_execution_id,
+        "bundle_id": compute_bundle_id(
+            _load_root(
+                ready_source_run.private_root
+                / "pilots"
+                / ready_source_run.pilot_id
+                / "runs"
+                / fresh_controls.target_execution_id
+            )
+        ),
+    }
+    assert completed.stderr == ""
+    assert completed.stdout == canonical_json_bytes(expected).decode("utf-8") + "\n"
+    assert json.loads(completed.stdout) == expected
+    assert "fal" not in completed.stdout.lower()
+
+    help_result = subprocess.run(
+        [sys.executable, str(REFRESH_SCRIPT), "--help"],
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        text=True,
+    )
+    assert help_result.returncode == 0, help_result.stderr
+    assert help_result.stderr == ""
+    help_text = help_result.stdout
+    for forbidden in (
+        "--private-root",
+        "--fal-key",
+        "--endpoint",
+        "--budget",
+        "--execute",
+        "--submit",
+        "--media-url",
+    ):
+        assert forbidden not in help_text
+
+
+def test_refresh_cli_emits_neutral_argument_and_issuer_errors(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+) -> None:
+    malformed = subprocess.run(
+        [sys.executable, str(REFRESH_SCRIPT), "--unexpected", "private-value"],
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        text=True,
+    )
+    assert malformed.returncode == 2
+    assert malformed.stdout == ""
+    assert malformed.stderr == "A2V_REFRESH_ARGUMENT_ERROR\n"
+
+    failed = subprocess.run(
+        _refresh_command(
+            ready_source_run,
+            replace(fresh_controls, target_execution_id=ready_source_run.execution_id),
+        ),
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        env=_refresh_environment(ready_source_run),
+        text=True,
+    )
+    assert failed.returncode == 2
+    assert failed.stdout == ""
+    assert failed.stderr == "A2V_REFRESH_FAILED\n"
+
+
+def test_refresh_cli_rejects_abbreviated_and_forbidden_options(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    tmp_path: Path,
+) -> None:
+    environment = _refresh_environment(ready_source_run, tmp_path)
+    abbreviated = _refresh_command(ready_source_run, fresh_controls)
+    abbreviated[abbreviated.index("--pilot-id")] = "--pilot"
+    completed = subprocess.run(
+        abbreviated,
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+    )
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert completed.stderr == "A2V_REFRESH_ARGUMENT_ERROR\n"
+
+    for forbidden in (
+        "--private-root",
+        "--fal-key",
+        "--endpoint",
+        "--budget",
+        "--execute",
+        "--submit",
+        "--media-url",
+        "--credential",
+        "--api-key",
+        "--receipt",
+        "--ledger",
+    ):
+        rejected = subprocess.run(
+            [*_refresh_command(ready_source_run, fresh_controls), forbidden, "private-value"],
+            capture_output=True,
+            cwd=REPOSITORY_ROOT,
+            env=environment,
+            text=True,
+        )
+        assert rejected.returncode == 2
+        assert rejected.stdout == ""
+        assert rejected.stderr == "A2V_REFRESH_ARGUMENT_ERROR\n"
+
+
+def test_fresh_issued_target_passes_policy_only_preflight(
     ready_source_run: ReadySourceRun,
     fresh_controls: FreshControls,
 ) -> None:
@@ -1592,6 +1830,7 @@ def test_refresh_target_passes_policy_only_preflight(
     )
 
     assert status.status == "ready_for_policy_issuance"
+    assert status.failed_gate is None
     assert (status.training_groups, status.holdout_groups, status.provider_validation_items) == (
         12,
         5,
@@ -1697,10 +1936,7 @@ def test_refresh_output_is_deterministic_for_identical_private_inputs(
     assert _tree_digests(first.run_dir) == _tree_digests(second.run_dir)
 
 
-def test_refresh_issuer_module_is_offline_only() -> None:
-    module_path = Path(__file__).parents[1] / "src" / "ltx_lora_pilot" / "a2v_refresh.py"
-    source = module_path.read_text(encoding="utf-8")
-
+def _assert_offline_only(source: str) -> None:
     for forbidden in (
         "fal_api",
         "a2v_execution",
@@ -1711,6 +1947,18 @@ def test_refresh_issuer_module_is_offline_only() -> None:
         "os.environ",
     ):
         assert forbidden not in source
+
+
+def test_refresh_module_is_offline_only() -> None:
+    _assert_offline_only(REFRESH_MODULE.read_text(encoding="utf-8"))
+
+
+def test_refresh_issuer_module_is_offline_only() -> None:
+    _assert_offline_only(
+        (REPOSITORY_ROOT / "src" / "ltx_lora_pilot" / "a2v_refresh.py").read_text(
+            encoding="utf-8"
+        )
+    )
 
 
 def test_refresh_does_not_call_network_receipt_or_ledger_paths(
@@ -1728,6 +1976,7 @@ def test_refresh_does_not_call_network_receipt_or_ledger_paths(
         raise AssertionError("fresh issuer crossed an offline authority boundary")
 
     monkeypatch.setattr(urllib.request, "urlopen", forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
     monkeypatch.setattr(socket, "create_connection", forbidden)
     monkeypatch.setattr(authorization, "_fetch_official_price", forbidden)
     monkeypatch.setattr(authorization, "issue_execution_receipt", forbidden)
