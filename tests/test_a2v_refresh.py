@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import stat
 from typing import Any
+import zipfile
 
 import pytest
 
@@ -18,16 +21,35 @@ from ltx_lora_pilot.a2v_bundle import (
 from ltx_lora_pilot.a2v_quality import CHECK_KEYS, validate_quality_and_splits
 from ltx_lora_pilot.a2v_refresh import (
     copy_accepted_candidates,
+    refresh_sealed_a2v_run,
     verify_source_run_static,
 )
-from ltx_lora_pilot.artifacts import atomic_write_json, canonical_json_bytes, sha256_file
-from ltx_lora_pilot.provider_validation import build_provider_validation_selection
+from ltx_lora_pilot.artifacts import (
+    atomic_write_json,
+    canonical_json_bytes,
+    sha256_file,
+    strict_load_json,
+)
+from ltx_lora_pilot.authorization import (
+    StandingAuthorization,
+    capture_price_evidence,
+    validate_execution_config,
+)
+from ltx_lora_pilot.pilot_ledger import migrate_legacy_ledger
+from ltx_lora_pilot.preflight import run_preflight
+from ltx_lora_pilot.provider_validation import (
+    build_provider_validation_selection,
+    validate_provider_validation_selection,
+)
 
 
 PILOT_ID = "pilot_00000000000040008000000000000001"
 EXECUTION_ID = "exec_00000000000040008000000000000002"
 POLICY_ID = "policy_00000000000040008000000000000003"
 LEDGER_ID = "ledger_00000000000040008000000000000004"
+FRESH_TARGET_EXECUTION_ID = "exec_00000000000040008000000000000006"
+FRESH_CREATED_AT = "2026-07-16T01:00:00Z"
+FRESH_EXPIRES_AT = "2026-07-16T12:00:00Z"
 
 
 @dataclass(frozen=True)
@@ -40,6 +62,17 @@ class ReadySourceRun:
     train_ids: list[str]
     holdout_ids: list[str]
     candidate_paths: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class FreshControls:
+    target_execution_id: str
+    created_at_utc: str
+    expires_at_utc: str
+    price_path: Path
+    policy_path: Path
+    prompts_path: Path
+    prompts: dict[str, str]
 
 
 def _group_id(index: int) -> str:
@@ -77,6 +110,22 @@ def _price() -> dict[str, Any]:
         "retrieved_at_utc": "2026-07-14T00:00:00Z",
         "expires_at_utc": "2026-07-14T12:00:00Z",
     }
+
+
+def _fresh_policy() -> dict[str, Any]:
+    value = _policy()
+    value["expires_at_utc"] = FRESH_EXPIRES_AT
+    return StandingAuthorization.from_dict(value, now=FRESH_CREATED_AT).to_dict()
+
+
+def _fresh_price() -> dict[str, Any]:
+    return capture_price_evidence(
+        fetch=lambda _: (
+            b"fal-ai/ltx23-trainer-v2/a2v Training costs 0.006 * steps; "
+            b"1000 steps cost $6.00."
+        ),
+        now=FRESH_CREATED_AT,
+    ).to_dict()
 
 
 def _make_candidates(candidate_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -296,6 +345,19 @@ def _tree_digests(root: Path) -> dict[str, tuple[int, str]]:
     }
 
 
+def _tree_metadata(root: Path) -> dict[str, tuple[int, int, int, int]]:
+    paths = [root, *sorted(root.rglob("*"), key=lambda item: str(item))]
+    return {
+        str(path.relative_to(root)): (
+            path.lstat().st_mode,
+            path.lstat().st_nlink,
+            path.lstat().st_size,
+            path.lstat().st_mtime_ns,
+        )
+        for path in paths
+    }
+
+
 def _expected_group_file_names(structural: dict[str, Any]) -> set[str]:
     return {
         record["name"]
@@ -385,6 +447,76 @@ def ready_source_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ReadySo
         holdout_ids=quality_summary["accepted_holdout_group_ids"],
         candidate_paths=tuple(sorted(candidate_dir.iterdir(), key=lambda path: path.name)),
     )
+
+
+@pytest.fixture
+def fresh_controls(ready_source_run: ReadySourceRun) -> FreshControls:
+    controls = ready_source_run.private_root / "fresh-controls"
+    price_path = controls / "price-evidence.json"
+    policy_path = controls / "standing-authorization.json"
+    prompts_path = controls / "validation-prompts.json"
+    prompts = {
+        ready_source_run.holdout_ids[0]: "A close talking-head shot with natural speech.",
+        ready_source_run.holdout_ids[1]: "A medium talking-head shot with steady eye contact.",
+    }
+    _write_json(price_path, _fresh_price())
+    _write_json(policy_path, _fresh_policy())
+    _write_json(prompts_path, prompts)
+    _secure_tree(ready_source_run.private_root)
+    return FreshControls(
+        target_execution_id=FRESH_TARGET_EXECUTION_ID,
+        created_at_utc=FRESH_CREATED_AT,
+        expires_at_utc=FRESH_EXPIRES_AT,
+        price_path=price_path,
+        policy_path=policy_path,
+        prompts_path=prompts_path,
+        prompts=prompts,
+    )
+
+
+def _refresh_kwargs(ready_source_run: ReadySourceRun, fresh_controls: FreshControls) -> dict[str, Any]:
+    return {
+        "private_root": ready_source_run.private_root,
+        "pilot_id": ready_source_run.pilot_id,
+        "source_execution_id": ready_source_run.execution_id,
+        "expected_source_bundle_id": ready_source_run.bundle_id,
+        "target_execution_id": fresh_controls.target_execution_id,
+        "created_at_utc": fresh_controls.created_at_utc,
+        "expires_at_utc": fresh_controls.expires_at_utc,
+        "fresh_price_evidence_path": fresh_controls.price_path,
+        "fresh_standing_authorization_path": fresh_controls.policy_path,
+        "validation_prompts_path": fresh_controls.prompts_path,
+        "repository_commit": "a" * 40,
+    }
+
+
+def _target_run_dir(kwargs: dict[str, Any]) -> Path:
+    return (
+        Path(kwargs["private_root"])
+        / "pilots"
+        / kwargs["pilot_id"]
+        / "runs"
+        / kwargs["target_execution_id"]
+    )
+
+
+def _load_root(run_dir: Path) -> dict[str, Any]:
+    return strict_load_json(run_dir / "bundle" / "bundle-manifest.json")
+
+
+def _target_split_counts(run_dir: Path) -> tuple[int, int]:
+    dataset = strict_load_json(run_dir / "bundle" / "dataset-manifest.json")
+    return dataset["counts"]["train_groups"], dataset["counts"]["holdout_groups"]
+
+
+def _selected_holdout_ids(run_dir: Path) -> list[str]:
+    selection = strict_load_json(run_dir / "validation" / "provider-validation-selection.json")
+    return [item["group_id"] for item in selection["items"]]
+
+
+def _archive_member_count(run_dir: Path) -> int:
+    with zipfile.ZipFile(run_dir / "bundle" / "training-data.zip") as archive:
+        return len(archive.infolist())
 
 
 def test_source_static_verifier_accepts_expired_execution_authority_when_bytes_are_bound(
@@ -564,3 +696,699 @@ def test_copy_accepted_candidates_rejects_an_aliased_destination_without_writing
         copy_accepted_candidates(snapshot, alias_parent / "candidates")
 
     assert not (actual_parent / "candidates").exists()
+
+
+def test_refresh_issues_a_fresh_bound_target_with_exact_split_and_selection(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+) -> None:
+    source_before = _tree_metadata(ready_source_run.run_dir)
+    result = refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
+
+    assert result.execution_id == fresh_controls.target_execution_id
+    assert result.bundle_id == compute_bundle_id(_load_root(result.run_dir))
+    assert _target_split_counts(result.run_dir) == (12, 5)
+    assert _selected_holdout_ids(result.run_dir) == sorted(fresh_controls.prompts)
+    assert _archive_member_count(result.run_dir) == 48
+    dataset = strict_load_json(result.run_dir / "bundle" / "dataset-manifest.json")
+    archive_names: set[str]
+    with zipfile.ZipFile(result.run_dir / "bundle" / "training-data.zip") as archive:
+        archive_names = {member.filename for member in archive.infolist()}
+    assert archive_names == {record["name"] for record in dataset["training_members"]}
+    assert archive_names.isdisjoint(
+        {
+            record["name"]
+            for group in dataset["groups"]["holdout"]
+            for record in group["files"]
+        }
+    )
+    config = validate_execution_config(
+        strict_load_json(result.run_dir / "control" / "execution-config.json")
+    )
+    source_config = strict_load_json(
+        ready_source_run.run_dir / "control" / "execution-config.json"
+    )
+    assert config["execution_id"] == fresh_controls.target_execution_id
+    assert (config["created_at_utc"], config["expires_at_utc"]) == (
+        fresh_controls.created_at_utc,
+        fresh_controls.expires_at_utc,
+    )
+    for field in ("trigger_phrase", "negative_prompt", "ledger_id"):
+        assert config[field] == source_config[field]
+    assert config["dataset_manifest_sha256"] == sha256_file(
+        result.run_dir / "bundle" / "dataset-manifest.json"
+    ).sha256
+    assert config["training_archive_sha256"] == sha256_file(
+        result.run_dir / "bundle" / "training-data.zip"
+    ).sha256
+    assert config["standing_authorization_sha256"] == sha256_file(
+        result.run_dir / "control" / "standing-authorization.json"
+    ).sha256
+    assert config["price_evidence_sha256"] == sha256_file(
+        result.run_dir / "control" / "price-evidence.json"
+    ).sha256
+    structural = strict_load_json(result.run_dir / "control" / "structural-report.json")
+    attestation = strict_load_json(result.run_dir / "control" / "quality-attestation.json")
+    selection = strict_load_json(
+        result.run_dir / "validation" / "provider-validation-selection.json"
+    )
+    validate_provider_validation_selection(
+        selection,
+        structural,
+        validate_quality_and_splits(attestation, structural),
+        config,
+        result.run_dir / "candidates",
+    )
+    assert set(_load_root(result.run_dir)["artifacts"]) == {
+        "plan",
+        "standing_authorization",
+        "price_evidence",
+        "structural_report",
+        "quality_attestation",
+        "dataset_manifest",
+        "training_archive",
+        "execution_config",
+        "provider_validation_selection",
+    }
+    assert _tree_metadata(ready_source_run.run_dir) == source_before
+
+
+def _configure_invalid_refresh_case(
+    kwargs: dict[str, Any],
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    case: str,
+) -> None:
+    if case == "same_execution":
+        kwargs["target_execution_id"] = ready_source_run.execution_id
+    elif case == "existing_target":
+        target = _target_run_dir(kwargs)
+        target.mkdir(parents=True)
+        (target / "sentinel").write_bytes(b"sentinel")
+    elif case == "one_prompt":
+        _write_json(fresh_controls.prompts_path, {ready_source_run.holdout_ids[0]: "One heldout prompt."})
+    elif case == "three_prompts":
+        _write_json(
+            fresh_controls.prompts_path,
+            {
+                **fresh_controls.prompts,
+                ready_source_run.holdout_ids[2]: "A third heldout prompt.",
+            },
+        )
+    elif case == "train_prompt":
+        _write_json(
+            fresh_controls.prompts_path,
+            {
+                ready_source_run.train_ids[0]: "A training prompt must not be selected.",
+                ready_source_run.holdout_ids[0]: "A heldout prompt remains valid.",
+            },
+        )
+    elif case == "outside_private_root":
+        outside = ready_source_run.private_root.parent / "outside-price-evidence.json"
+        _write_json(outside, _fresh_price())
+        kwargs["fresh_price_evidence_path"] = outside
+    elif case == "linked_policy":
+        _replace_with_link(fresh_controls.policy_path)
+    elif case == "expired_price":
+        value = _fresh_price()
+        value["expires_at_utc"] = "2026-07-16T11:59:59Z"
+        _write_json(fresh_controls.price_path, value)
+    else:
+        raise AssertionError(f"unexpected test case: {case}")
+
+
+def _assert_no_new_target_or_preserved_sentinel(kwargs: dict[str, Any], case: str) -> None:
+    target = _target_run_dir(kwargs)
+    if case == "same_execution":
+        assert target.is_dir()
+    elif case == "existing_target":
+        assert (target / "sentinel").read_bytes() == b"sentinel"
+        assert list(target.iterdir()) == [target / "sentinel"]
+    else:
+        assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "same_execution",
+        "existing_target",
+        "one_prompt",
+        "three_prompts",
+        "train_prompt",
+        "outside_private_root",
+        "linked_policy",
+        "expired_price",
+    ],
+)
+def test_refresh_rejects_untrusted_controls_or_target_contract_violations(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    case: str,
+) -> None:
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
+    _configure_invalid_refresh_case(kwargs, ready_source_run, fresh_controls, case)
+    source_before = _tree_digests(ready_source_run.run_dir)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**kwargs)
+
+    assert _tree_digests(ready_source_run.run_dir) == source_before
+    _assert_no_new_target_or_preserved_sentinel(kwargs, case)
+
+
+def test_refresh_never_overwrites_a_target_created_at_publication_time(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
+    target = _target_run_dir(kwargs)
+    source_before = _tree_digests(ready_source_run.run_dir)
+
+    def create_racing_sentinel(staging: Path, target_path: Path) -> bool:
+        target_path.mkdir()
+        (target_path / "sentinel").write_bytes(b"sentinel")
+        return False
+
+    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", create_racing_sentinel)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**kwargs)
+
+    assert (target / "sentinel").read_bytes() == b"sentinel"
+    assert _tree_digests(ready_source_run.run_dir) == source_before
+    assert not [path for path in target.parent.iterdir() if path.name.startswith(".a2v-refresh-")]
+
+
+def test_refresh_does_not_use_replace_for_final_publication(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    moved: list[tuple[Path, Path]] = []
+    original = a2v_refresh._move_directory_no_replace
+
+    def record_move(staging: Path, target: Path) -> bool:
+        moved.append((staging, target))
+        return original(staging, target)
+
+    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", record_move)
+
+    result = refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
+
+    assert result.run_dir.is_dir()
+    assert moved == [(moved[0][0], result.run_dir)]
+    publication_source = inspect.getsource(a2v_refresh._publish_new_run_no_replace)
+    assert "os.replace" not in publication_source
+    assert "os.rename" not in publication_source
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows MoveFileExW semantics")
+def test_refresh_windows_no_replace_preserves_a_preexisting_target(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+) -> None:
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
+    target = _target_run_dir(kwargs)
+    target.mkdir(parents=True)
+    (target / "sentinel").write_bytes(b"sentinel")
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**kwargs)
+
+    assert (target / "sentinel").read_bytes() == b"sentinel"
+
+
+def test_refresh_fails_closed_when_no_replace_primitive_is_unavailable(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", lambda staging, target: False)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
+
+    assert not _target_run_dir(_refresh_kwargs(ready_source_run, fresh_controls)).exists()
+
+
+def test_refresh_rechecks_staged_control_expiry_before_publication(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    original = a2v_refresh._fresh_execution_config
+
+    def expire_staged_price(**kwargs: Any) -> dict[str, Any]:
+        price_path = Path(kwargs["price_path"])
+        value = strict_load_json(price_path)
+        value["expires_at_utc"] = "2026-07-16T11:59:59Z"
+        os.chmod(price_path, 0o600)
+        _write_json(price_path, value)
+        return original(**kwargs)
+
+    monkeypatch.setattr(a2v_refresh, "_fresh_execution_config", expire_staged_price)
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
+    source_before = _tree_digests(ready_source_run.run_dir)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**kwargs)
+
+    assert _tree_digests(ready_source_run.run_dir) == source_before
+    assert not _target_run_dir(kwargs).exists()
+
+
+def test_refresh_rejects_a_control_parent_replaced_after_canonicalization(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canonical input path cannot be reused through a swapped parent."""
+
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    original_sha256 = a2v_refresh.sha256_file
+    controls = fresh_controls.price_path.parent
+    quarantined = controls.with_name("fresh-controls-original")
+    swapped = False
+    blocked = False
+
+    def swap_parent_before_digest(path: Path) -> Any:
+        nonlocal blocked, swapped
+        if Path(path).name == fresh_controls.price_path.name and not swapped:
+            try:
+                controls.rename(quarantined)
+            except OSError:
+                blocked = True
+                raise
+            controls.mkdir()
+            for name in (
+                fresh_controls.price_path.name,
+                fresh_controls.policy_path.name,
+                fresh_controls.prompts_path.name,
+            ):
+                replacement = controls / name
+                replacement.write_bytes((quarantined / name).read_bytes())
+                if os.name != "nt":
+                    os.chmod(replacement, 0o600)
+            if os.name != "nt":
+                os.chmod(controls, 0o700)
+            swapped = True
+        return original_sha256(path)
+
+    monkeypatch.setattr(a2v_refresh, "sha256_file", swap_parent_before_digest)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
+
+    assert swapped or blocked
+    assert not _target_run_dir(_refresh_kwargs(ready_source_run, fresh_controls)).exists()
+
+
+def test_refresh_rechecks_staged_policy_ceiling_before_publication(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    original = a2v_refresh._fresh_execution_config
+
+    def change_staged_policy_ceiling(**kwargs: Any) -> dict[str, Any]:
+        policy_path = Path(kwargs["policy_path"])
+        value = strict_load_json(policy_path)
+        value["cumulative_cap_usd"] = "12.0001"
+        os.chmod(policy_path, 0o600)
+        _write_json(policy_path, value)
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        a2v_refresh, "_fresh_execution_config", change_staged_policy_ceiling
+    )
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**kwargs)
+
+    assert not _target_run_dir(kwargs).exists()
+
+
+def test_refresh_rejects_a_published_tree_tampered_after_the_final_staging_check(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    def move_then_tamper(staging: Path, target: Path) -> bool:
+        staging.rename(target)
+        plan = target / "plan.md"
+        os.chmod(plan, 0o600)
+        plan.write_bytes(b"tampered after publication")
+        if os.name != "nt":
+            os.chmod(plan, 0o400)
+        return True
+
+    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", move_then_tamper)
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**kwargs)
+
+    assert (target := _target_run_dir(kwargs)).is_dir()
+    assert (target / "plan.md").read_bytes() == b"tampered after publication"
+
+
+def test_refresh_rejects_a_target_replaced_after_the_no_replace_move(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    def move_then_replace(staging: Path, target: Path) -> bool:
+        staging.rename(target)
+        target.rename(target.with_name("published-tree-quarantined"))
+        target.mkdir()
+        (target / "sentinel").write_bytes(b"replacement target")
+        return True
+
+    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", move_then_replace)
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**kwargs)
+
+    target = _target_run_dir(kwargs)
+    assert (target / "sentinel").read_bytes() == b"replacement target"
+
+
+def test_refresh_cleanup_fails_closed_on_a_nested_staging_alias_swap(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    external = ready_source_run.private_root.parent / "external-candidates"
+    external.mkdir()
+    protected_name = ready_source_run.candidate_paths[0].name
+    protected = external / protected_name
+    protected.write_bytes(b"external content must survive cleanup")
+    original_walk = a2v_refresh._snapshot_staging_cleanup_tree
+    armed = False
+    swapped = False
+
+    def move_failure(staging: Path, target: Path) -> bool:
+        nonlocal armed
+        armed = True
+        return False
+
+    def swap_after_walk(
+        root: Path,
+    ) -> tuple[list[Path], list[Path], list[Any]]:
+        nonlocal swapped
+        files, directories, records = original_walk(root)
+        if armed and not swapped:
+            candidates = Path(root) / "candidates"
+            candidates.rename(Path(root).parent / ".quarantined-candidates")
+            try:
+                candidates.symlink_to(external, target_is_directory=True)
+            except OSError:
+                pytest.skip("directory symlinks are unavailable on this Windows host")
+            swapped = True
+        return files, directories, records
+
+    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", move_failure)
+    monkeypatch.setattr(a2v_refresh, "_snapshot_staging_cleanup_tree", swap_after_walk)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
+
+    assert swapped
+    assert protected.read_bytes() == b"external content must survive cleanup"
+
+
+def test_refresh_cleanup_fails_closed_when_a_nested_directory_is_replaced(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup must not delete a normal directory swapped in after its walk."""
+
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    replacement = ready_source_run.private_root.parent / "attacker-candidates"
+    replacement.mkdir()
+    candidate_names = sorted(path.name for path in ready_source_run.candidate_paths)
+    for name in candidate_names:
+        (replacement / name).write_bytes(b"must survive cleanup")
+        if os.name != "nt":
+            os.chmod(replacement / name, 0o600)
+    if os.name != "nt":
+        os.chmod(replacement, 0o700)
+    protected_name = candidate_names[0]
+    original_walk = a2v_refresh._snapshot_staging_cleanup_tree
+    armed = False
+    swapped = False
+    protected: Path | None = None
+
+    def move_failure(staging: Path, target: Path) -> bool:
+        nonlocal armed
+        armed = True
+        return False
+
+    def swap_after_walk(
+        root: Path,
+    ) -> tuple[list[Path], list[Path], list[Any]]:
+        nonlocal swapped, protected
+        files, directories, records = original_walk(root)
+        if armed and not swapped:
+            candidates = Path(root) / "candidates"
+            candidates.rename(Path(root).parent / ".quarantined-candidates")
+            replacement.rename(candidates)
+            protected = candidates / protected_name
+            swapped = True
+        return files, directories, records
+
+    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", move_failure)
+    monkeypatch.setattr(a2v_refresh, "_snapshot_staging_cleanup_tree", swap_after_walk)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
+
+    assert swapped
+    assert protected is not None
+    assert protected.read_bytes() == b"must survive cleanup"
+
+
+def _typed_legacy_id(prefix: str, number: int) -> str:
+    return f"{prefix}_{number:012x}40008{number:015x}"
+
+
+def _install_matching_pilot_ledger(private_root: Path) -> None:
+    amounts = ["1.2000", "0.1099", "0.1099", "0.3272", "0.3272", "1.4667"]
+    states = ["consumed", "consumed", "consumed", "consumed", "reserved", "consumed"]
+    source_entries: list[dict[str, Any]] = []
+    manifest_entries: list[dict[str, Any]] = []
+    for index, (amount, state) in enumerate(zip(amounts, states, strict=True), start=1):
+        source_id = f"00000000-0000-4000-8000-{index:012x}"
+        source_entries.append(
+            {
+                "id": source_id,
+                "label": f"synthetic legacy item {index}",
+                "amount_usd": amount,
+                "status": state,
+                "created_at": 1_700_000_000 + index,
+                **(
+                    {"finalized_at": 1_700_000_100 + index}
+                    if state != "reserved"
+                    else {}
+                ),
+            }
+        )
+        manifest_entries.append(
+            {
+                "source_entry_id": source_id,
+                "reservation_id": _typed_legacy_id("reservation", index + 20),
+                "bundle_id": hashlib.sha256(f"legacy-{index}".encode("ascii")).hexdigest(),
+                "execution_id": _typed_legacy_id("exec", index + 40),
+                "amount_usd": amount,
+                "state": state,
+            }
+        )
+    source = {"cap_usd": "12.0000", "entries": source_entries}
+    manifest = {
+        "schema_version": "pilot-budget-migration-v1",
+        "pilot_id": PILOT_ID,
+        "ledger_id": LEDGER_ID,
+        "migration_id": _typed_legacy_id("migration", 7),
+        "cap_usd": "12.0000",
+        "source_ledger_sha256": hashlib.sha256(canonical_json_bytes(source)).hexdigest(),
+        "created_at_utc": "2026-07-16T00:00:00Z",
+        "entries": manifest_entries,
+    }
+    ledger_dir = private_root / "pilots" / PILOT_ID / "ledger"
+    evidence_dir = private_root / "migration-evidence"
+    ledger_dir.mkdir(parents=True)
+    evidence_dir.mkdir()
+    source_path = evidence_dir / "legacy.json"
+    manifest_path = evidence_dir / "manifest.json"
+    _write_json(source_path, source)
+    _write_json(manifest_path, manifest)
+    migrate_legacy_ledger(source_path, manifest_path, ledger_dir / "pilot.sqlite3")
+    _secure_tree(private_root)
+
+
+def test_refresh_target_passes_policy_only_preflight(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+) -> None:
+    result = refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
+    _install_matching_pilot_ledger(ready_source_run.private_root)
+
+    status = run_preflight(
+        result.run_dir,
+        result.bundle_id,
+        require_receipt=False,
+        approved_private_root=ready_source_run.private_root,
+        clock=lambda: datetime(2026, 7, 16, 1, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert status.status == "ready_for_policy_issuance"
+    assert (status.training_groups, status.holdout_groups, status.provider_validation_items) == (
+        12,
+        5,
+        2,
+    )
+
+
+def test_refresh_target_mutation_after_issuance_is_rejected_by_downstream_preflight(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+) -> None:
+    result = refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
+    _install_matching_pilot_ledger(ready_source_run.private_root)
+    plan = result.run_dir / "plan.md"
+    os.chmod(plan, 0o600)
+    plan.write_bytes(b"mutated after issuance")
+    if os.name != "nt":
+        os.chmod(plan, 0o400)
+    assert sha256_file(plan).sha256 != _load_root(result.run_dir)["artifacts"]["plan"]["sha256"]
+
+    status = run_preflight(
+        result.run_dir,
+        result.bundle_id,
+        require_receipt=False,
+        approved_private_root=ready_source_run.private_root,
+        clock=lambda: datetime(2026, 7, 16, 1, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert status.status == "failed"
+    assert status.failed_gate == "root_artifact_hashes"
+
+
+def test_refresh_output_is_deterministic_for_identical_private_inputs(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    tmp_path: Path,
+) -> None:
+    second_private_root = tmp_path / "second-private"
+    shutil.copytree(ready_source_run.private_root, second_private_root)
+    second_source = ReadySourceRun(
+        private_root=second_private_root,
+        pilot_id=ready_source_run.pilot_id,
+        execution_id=ready_source_run.execution_id,
+        run_dir=(
+            second_private_root
+            / "pilots"
+            / ready_source_run.pilot_id
+            / "runs"
+            / ready_source_run.execution_id
+        ),
+        bundle_id=ready_source_run.bundle_id,
+        train_ids=ready_source_run.train_ids,
+        holdout_ids=ready_source_run.holdout_ids,
+        candidate_paths=tuple(
+            sorted(
+                (
+                    second_private_root
+                    / "pilots"
+                    / ready_source_run.pilot_id
+                    / "runs"
+                    / ready_source_run.execution_id
+                    / "candidates"
+                ).iterdir(),
+                key=lambda path: path.name,
+            )
+        ),
+    )
+    second_controls = FreshControls(
+        target_execution_id=fresh_controls.target_execution_id,
+        created_at_utc=fresh_controls.created_at_utc,
+        expires_at_utc=fresh_controls.expires_at_utc,
+        price_path=second_private_root / fresh_controls.price_path.relative_to(ready_source_run.private_root),
+        policy_path=second_private_root / fresh_controls.policy_path.relative_to(ready_source_run.private_root),
+        prompts_path=second_private_root / fresh_controls.prompts_path.relative_to(ready_source_run.private_root),
+        prompts=fresh_controls.prompts,
+    )
+
+    first = refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
+    second = refresh_sealed_a2v_run(**_refresh_kwargs(second_source, second_controls))
+
+    assert first.bundle_id == second.bundle_id
+    assert _tree_digests(first.run_dir) == _tree_digests(second.run_dir)
+
+
+def test_refresh_issuer_module_is_offline_only() -> None:
+    module_path = Path(__file__).parents[1] / "src" / "ltx_lora_pilot" / "a2v_refresh.py"
+    source = module_path.read_text(encoding="utf-8")
+
+    for forbidden in (
+        "fal_api",
+        "a2v_execution",
+        "httpx",
+        "requests",
+        "urllib",
+        "socket",
+        "os.environ",
+    ):
+        assert forbidden not in source
+
+
+def test_refresh_does_not_call_network_receipt_or_ledger_paths(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import socket
+    import urllib.request
+
+    import ltx_lora_pilot.authorization as authorization
+    import ltx_lora_pilot.pilot_ledger as pilot_ledger
+
+    def forbidden(*_: Any, **__: Any) -> None:
+        raise AssertionError("fresh issuer crossed an offline authority boundary")
+
+    monkeypatch.setattr(urllib.request, "urlopen", forbidden)
+    monkeypatch.setattr(socket, "create_connection", forbidden)
+    monkeypatch.setattr(authorization, "_fetch_official_price", forbidden)
+    monkeypatch.setattr(authorization, "issue_execution_receipt", forbidden)
+    monkeypatch.setattr(authorization, "verify_execution_receipt", forbidden)
+    monkeypatch.setattr(pilot_ledger.PilotLedger, "open_existing", forbidden)
+    monkeypatch.setattr(pilot_ledger.PilotLedger, "reserve", forbidden)
+    monkeypatch.setattr(pilot_ledger.PilotLedger, "reserve_training", forbidden)
+
+    result = refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
+
+    assert result.run_dir.is_dir()
