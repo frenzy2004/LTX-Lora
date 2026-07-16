@@ -11,14 +11,14 @@
 ## Global Constraints
 
 - The issuer is offline-only: it must not import a Fal/provider client, perform network I/O, resolve a credential, issue a receipt, reserve budget, upload media, or queue training.
-- Resolve source and destination only as `<private-root>/pilots/<pilot-id>/runs/<execution-id>` with `require_canonical_run_dir`; do not accept arbitrary run directories.
+- Resolve source only with `require_canonical_run_dir`. Derive a non-existing destination solely from a new typed-ID helper under `<private-root>/pilots/<pilot-id>/runs/<execution-id>`; do not accept arbitrary run directories.
 - The target execution ID must differ from the source, be canonical, and have no pre-existing directory, link, file, or alias.
 - Preserve exactly the accepted source groups and split: 12 train groups and 5 holdout groups; copy exactly four regular, independent files per group.
 - Validate source hashes and schemas statically without treating an expired source policy, price evidence, or execution expiry as execution authority.
 - Fresh policy and price inputs must validate at the supplied creation timestamp and outlive the supplied target expiry.
 - Target config is the fixed `a2v-execution-config-v2` contract: rank 32, 1,000 steps, `0.0002` learning rate, 89 frames/24 fps, high 9:16, fixed audio controls, and `6.0000`/`1.2500`/`12.0000` ceilings.
 - Validation prompts are an explicit canonical map of exactly two distinct accepted holdout group IDs; never infer prompts or select training groups.
-- Publish only after all target artifacts are valid. On failure remove only the unique staging tree; never overwrite an existing target, source, ledger, policy source, price source, or prompt map.
+- Publish only after all target artifacts are valid, using a same-volume no-replace primitive (`MoveFileExW` without a replace-existing flag on Windows; an explicit fail-closed no-replace implementation elsewhere). On failure remove only the tracked unique staging tree; never overwrite an existing target, source, ledger, policy source, price source, or prompt map.
 - Normal CLI output must be sanitized and must not contain credentials, media paths, raw source IDs, URLs, or provider details.
 - Keep all unrelated working-tree edits unstaged and unmodified.
 
@@ -26,9 +26,11 @@
 
 ## File structure
 
-- `src/ltx_lora_pilot/a2v_refresh.py` — source-static verification, copy-to-staging, deterministic target construction, atomic publication, and a sanitized result type.
-- `scripts/refresh_a2v_run.py` — narrow, neutral-error CLI that calls the issuer with canonical IDs and local fresh evidence paths.
-- `tests/test_a2v_refresh.py` — real filesystem tests for the issuer and its CLI boundary.
+- `src/ltx_lora_pilot/private_workspace.py` — a narrow typed-ID destination derivation helper and root-contained canonical private-file resolver.
+- `src/ltx_lora_pilot/preflight.py` — a public static-bundle verifier which runs provenance/integrity gates but deliberately excludes freshness, receipt, ledger, and paid-execution gates.
+- `src/ltx_lora_pilot/a2v_refresh.py` — FD-safe source/control copying, exact 17/12/5 checks, deterministic target construction, no-replace publication, and a sanitized result type.
+- `scripts/refresh_a2v_run.py` — narrow, neutral-error CLI that uses the existing approved-private-root environment resolution and canonical IDs only.
+- `tests/test_a2v_refresh.py` and `tests/test_private_workspace.py` — real filesystem tests for the issuer, static verifier, destination resolver, no-overwrite race, and CLI boundary.
 - `docs/superpowers/specs/2026-07-16-a2v-fresh-bundle-issuer-design.md` — already committed design authority; no production behavior belongs in the document.
 
 ### Task 1: Source-static verifier and isolated candidate copy
@@ -37,11 +39,14 @@
 
 - Create: `src/ltx_lora_pilot/a2v_refresh.py`
 - Create: `tests/test_a2v_refresh.py`
+- Modify: `src/ltx_lora_pilot/private_workspace.py`
+- Modify: `src/ltx_lora_pilot/preflight.py`
+- Modify: `tests/test_private_workspace.py`
 
 **Interfaces:**
 
-- Consumes: `require_canonical_run_dir`, `strict_load_json`, `canonical_json_bytes`, `sha256_file`, `validate_a2v_directory`, `validate_quality_and_splits`, `validate_execution_config`, `compute_bundle_id`.
-- Produces: `verify_source_run_static(private_root, pilot_id, source_execution_id, expected_source_bundle_id) -> SourceRunSnapshot` and `copy_accepted_candidates(snapshot, destination) -> tuple[dict[str, Any], dict[str, Any]]` for later target construction.
+- Consumes: `require_canonical_run_dir`, `approved_private_root_from_environment`, `strict_load_json`, `canonical_json_bytes`, `validate_a2v_directory`, `validate_quality_and_splits`, `validate_execution_config`, `compute_bundle_id`.
+- Produces: `canonical_new_run_dir(private_root, pilot_id, execution_id) -> Path`, `require_canonical_private_file(private_root, path) -> Path`, `verify_static_a2v_bundle(private_root, run_dir, expected_bundle_id) -> StaticA2VBundle`, `verify_source_run_static(private_root, pilot_id, source_execution_id, expected_source_bundle_id) -> SourceRunSnapshot`, and `copy_accepted_candidates(snapshot, destination) -> tuple[dict[str, Any], dict[str, Any]]` for later target construction.
 
 - [ ] **Step 1: Write the failing source-verification test**
 
@@ -127,7 +132,7 @@ def _require_regular(path: Path, *, directory: bool = False) -> None:
         raise ValueError("private refresh input must be a regular file")
 ```
 
-`_verify_root_artifacts` must derive paths only from the fixed artifact-role map, hash each regular file with `sha256_file`, and compare exact byte count/digest records. It must call `compute_bundle_id(root)` and compare it to `expected_source_bundle_id`. After `validate_a2v_directory`, require `canonical_json_bytes(reproduced_structural) == canonical_json_bytes(stored_structural)` and validate/reproduce the quality split with `validate_quality_and_splits`.
+Before `a2v_refresh.py` is written, expose a public `verify_static_a2v_bundle` in `preflight.py`. It must execute the existing canonical-artifact, bundle-ID, root-artifact-pin, archive-inspection, archive-structural, candidate-rerun, quality, rebuilt-manifest, provider-selection, and request-allowlist checks in the same order as `run_preflight`; it must skip only old price/policy freshness, receipt validation, ledger inspection, and final temporal recheck. It must always close the retained archive and return deep-copied/static artifacts plus the canonical path context. `verify_source_run_static` calls this public verifier and then adds the exact 17 structural groups / 12 train / 5 holdout contract check.
 
 - [ ] **Step 4: Run the focused test to verify it passes**
 
@@ -185,7 +190,7 @@ def test_copy_accepted_candidates_uses_independent_regular_files(
     assert {path.name for path in target.iterdir()} == expected_group_file_names(structural)
 ```
 
-Implement copy with exclusive file creation (`destination.open("xb")`), streamed bytes and `fsync`, a current source pin/hash recheck before and after each copy, then a target hash recheck. Reject a source whose path is linked, a target alias, an unexpected candidate file, or a copied digest mismatch. Do not use `copytree`, hard links, or symlinks.
+Implement copy by reusing `staging._copy_sealed_file` for every candidate and control input: it provides no-follow FD opening, exclusive destination creation, stream hashing, fsync, source identity rechecks, and single-link output validation. Reject a source whose path is linked, a target alias, an unexpected candidate file, or a copied digest mismatch. Do not use `copytree`, hard links, or symlinks. Require exactly 17 structural groups, 68 candidate files, 12 accepted train IDs, and 5 accepted holdout IDs before and after the staged rerun.
 
 - [ ] **Step 7: Run Task 1 tests and commit**
 
@@ -268,7 +273,7 @@ def refresh_sealed_a2v_run(
         source_execution_id=source_execution_id,
         expected_source_bundle_id=expected_source_bundle_id,
     )
-    target_dir = _canonical_target_dir(private_root, pilot_id, target_execution_id)
+    target_dir = canonical_new_run_dir(private_root, pilot_id, target_execution_id)
     _require_absent_target(target_dir, source_execution_id, target_execution_id)
     price, policy, prompts = _load_fresh_controls(
         fresh_price_evidence_path, fresh_standing_authorization_path,
@@ -281,7 +286,7 @@ def refresh_sealed_a2v_run(
         )
 ```
 
-Load the three external inputs only as regular canonical files. Validate `PriceEvidence.from_dict(price, now=created_at_utc)` and `StandingAuthorization.from_dict(policy, now=created_at_utc)`, then require their expiries to be at or after `expires_at_utc`. Validate a prompt map as an exact JSON object with two canonical prompt strings; pass it directly to `build_provider_validation_selection` after copied candidates exist.
+Load the three external inputs only through `require_canonical_private_file` beneath the approved private root, then copy them into staging through `staging._copy_sealed_file` before parsing. Validate staged `PriceEvidence.from_dict(price, now=created_at_utc)` and `StandingAuthorization.from_dict(policy, now=created_at_utc)`, then require their expiries to be at or after `expires_at_utc`. Validate a staged prompt map as an exact JSON object with two canonical prompt strings; pass it directly to `build_provider_validation_selection` after copied candidates exist.
 
 Create the fixed config from source `trigger_phrase` and `negative_prompt` only. Copy no source price/policy/config bindings into the fresh config; calculate new archive, manifest, policy and price digests. Call `validate_execution_config` before writing it.
 
@@ -333,7 +338,7 @@ with _fresh_private_staging(private_root, pilot_id, target_execution_id) as stag
     _publish_new_run(staging, canonical_target_run_dir)
 ```
 
-`_fresh_private_staging` must be sibling to the target inside the canonical `runs` directory, owner-only, and unique. `_publish_new_run` must use create-only target checks immediately before `os.replace`, ensure target is absent and not linked, fsync the parent where supported, and never replace/merge an existing output. Cleanup must remove only the staging directory and reject a staging escape. On Windows, use `path.stat(follow_symlinks=False)` and the project’s junction checks for every directory traversal boundary.
+`_fresh_private_staging` must be sibling to the target inside the canonical `runs` directory, owner-only, and unique. `_publish_new_run` must use `MoveFileExW(staging, target, MOVEFILE_WRITE_THROUGH)` with no replace-existing flag on Windows; if that no-replace primitive is unavailable on another platform, fail closed rather than use `os.replace` or `os.rename`. Ensure target is absent, not linked, and still nonexisting immediately before publication; a target created in the final race must cause publication failure and leave that sentinel unchanged. Securely walk and validate the staging tree before publication with the preflight private-tree model; cleanup must remove only the tracked staging identity and must fail closed if a reparse/escape is detected. On Windows, use `path.stat(follow_symlinks=False)` and the project’s junction checks for every directory traversal boundary.
 
 - [ ] **Step 6: Add full artifact and failure-cleanup tests**
 
@@ -352,7 +357,7 @@ def test_refresh_failure_leaves_no_partial_target_and_never_changes_source(
     assert staging_children(ready_source_run.private_root) == []
 ```
 
-Also test deterministic issuance by invoking two independent private roots with byte-identical explicit inputs and asserting byte-for-byte equality of all target files except their intentionally distinct canonical root location.
+Also test deterministic issuance by invoking two independent private roots with byte-identical explicit inputs and asserting byte-for-byte equality of all target files except their intentionally distinct canonical root location. Add a target-publication race test that creates a sentinel target after the final absence check and before the no-replace move. It must assert the issuer raises, the sentinel contents remain unchanged, the source tree digests remain unchanged, and the staging session is removed only if its original tracked identity remains safe.
 
 - [ ] **Step 7: Run Task 2 tests and commit**
 
@@ -389,7 +394,7 @@ def test_refresh_cli_issues_target_and_exposes_no_paid_or_provider_options(
     assert json.loads(completed.stdout)["status"] == "issued"
     assert "fal" not in completed.stdout.lower()
     help_text = subprocess.run([sys.executable, str(REFRESH_SCRIPT), "--help"], capture_output=True, text=True).stdout
-    for forbidden in ("--fal-key", "--endpoint", "--budget", "--execute", "--submit", "--media-url"):
+    for forbidden in ("--private-root", "--fal-key", "--endpoint", "--budget", "--execute", "--submit", "--media-url"):
         assert forbidden not in help_text
 
 def test_fresh_issued_target_passes_policy_only_preflight(
@@ -413,7 +418,6 @@ Expected: FAIL because the CLI file does not exist and the result does not expos
 - [ ] **Step 3: Implement the neutral CLI**
 
 ```python
-parser.add_argument("--private-root", type=Path, required=True)
 parser.add_argument("--pilot-id", required=True)
 parser.add_argument("--source-execution-id", required=True)
 parser.add_argument("--expected-source-bundle-id", required=True)
@@ -426,14 +430,14 @@ parser.add_argument("--validation-prompts", type=Path, required=True)
 parser.add_argument("--repository-commit", required=True)
 ```
 
-Use a custom `ArgumentParser.error` that emits exactly `A2V_REFRESH_ARGUMENT_ERROR`. Catch every issuer exception and emit exactly `A2V_REFRESH_FAILED`; do not print exception text. On success print `canonical_json_bytes` of the three public fields. Do not import `ltx_lora_pilot.fal_api`, `a2v_execution`, `httpx`, `urllib`, or any credential resolver.
+Use `approved_private_root_from_environment()` inside the CLI; do not expose a `--private-root` option. Use a custom `ArgumentParser.error` that emits exactly `A2V_REFRESH_ARGUMENT_ERROR`. Catch every issuer exception and emit exactly `A2V_REFRESH_FAILED`; do not print exception text. On success print `canonical_json_bytes` of the three public fields. Do not import `ltx_lora_pilot.fal_api`, `a2v_execution`, `httpx`, `urllib`, `socket`, or any credential resolver.
 
 - [ ] **Step 4: Add import/network regression tests**
 
 ```python
 def test_refresh_module_is_offline_only() -> None:
     source = REFRESH_MODULE.read_text(encoding="utf-8")
-    for forbidden in ("fal_api", "a2v_execution", "httpx", "requests", "urllib", "os.environ"):
+    for forbidden in ("fal_api", "a2v_execution", "httpx", "requests", "urllib", "socket", "os.environ"):
         assert forbidden not in source
 ```
 
