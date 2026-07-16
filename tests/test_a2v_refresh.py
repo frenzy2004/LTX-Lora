@@ -389,6 +389,13 @@ def ready_source_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ReadySo
 
     private_root = tmp_path / "private"
     run_dir = private_root / "pilots" / PILOT_ID / "runs" / EXECUTION_ID
+    runs_dir = run_dir.parent
+    runs_dir.mkdir(parents=True)
+    if os.name == "nt":
+        import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+        # The issuer only creates children below an already-private runs root.
+        a2v_refresh._normalize_windows_staging_dacl(runs_dir)
     candidate_dir = run_dir / "candidates"
     control = run_dir / "control"
     bundle = run_dir / "bundle"
@@ -506,6 +513,72 @@ def test_staging_privacy_rejects_explicit_nonowner_windows_ace(
 
     with pytest.raises(ValueError, match="not private"):
         require_private(candidate)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows DACL semantics")
+@pytest.mark.parametrize("kind", ["directory", "file"])
+def test_windows_staging_dacl_rejects_inherited_interactive_ace_and_normalizes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    inherited_parent = tmp_path / "interactive-parent"
+    inherited_parent.mkdir()
+    granted = subprocess.run(
+        ["icacls", str(inherited_parent), "/grant", "*S-1-5-4:(OI)(CI)(RX)"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert granted.returncode == 0, granted.stdout + granted.stderr
+    candidate = inherited_parent / f"inherited-interactive-{kind}"
+    if kind == "directory":
+        candidate.mkdir()
+        require_private = a2v_refresh._require_staging_directory
+    else:
+        candidate.write_bytes(b"private")
+        require_private = a2v_refresh._require_staging_regular_file
+    listed = subprocess.run(
+        ["icacls", str(candidate)], capture_output=True, check=False, text=True
+    )
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert "(I)" in listed.stdout
+    assert "INTERACTIVE" in listed.stdout or "S-1-5-4" in listed.stdout
+
+    monkeypatch.setattr(a2v_refresh._preflight, "_WINDOWS_DACL_CHECK", lambda _path: None)
+    with pytest.raises(ValueError, match="not private"):
+        require_private(candidate)
+
+    with pytest.raises(ValueError, match="DACL"):
+        a2v_refresh._require_windows_explicit_owner_only_dacl(candidate)
+
+    a2v_refresh._normalize_windows_staging_dacl(candidate)
+    a2v_refresh._require_windows_explicit_owner_only_dacl(candidate)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows DACL semantics")
+def test_refresh_refuses_an_interactive_runs_parent_before_staging(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+) -> None:
+    """A non-owner inheritable ACE on runs cannot race a new staging child."""
+
+    runs = ready_source_run.run_dir.parent
+    granted = subprocess.run(
+        ["icacls", str(runs), "/grant", "*S-1-5-4:(OI)(CI)(M)"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert granted.returncode == 0, granted.stdout + granted.stderr
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
+
+    with pytest.raises(ValueError, match="not private"):
+        refresh_sealed_a2v_run(**kwargs)
+
+    assert not any(path.name.startswith(".a2v-refresh-") for path in runs.iterdir())
 
 
 def _refresh_kwargs(ready_source_run: ReadySourceRun, fresh_controls: FreshControls) -> dict[str, Any]:
@@ -974,128 +1047,66 @@ def test_refresh_fails_closed_when_no_replace_primitive_is_unavailable(
     assert not _target_run_dir(_refresh_kwargs(ready_source_run, fresh_controls)).exists()
 
 
-def test_refresh_refuses_staging_before_posix_cleanup_support_is_available(
+def test_refresh_refuses_before_staging_when_windows_runtime_is_unavailable(
     ready_source_run: ReadySourceRun,
     fresh_controls: FreshControls,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import ltx_lora_pilot.a2v_refresh as a2v_refresh
 
+    created_staging = False
+    original_mkdtemp = a2v_refresh.tempfile.mkdtemp
+
+    def record_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        nonlocal created_staging
+        if kwargs.get("prefix") == a2v_refresh._STAGING_PREFIX:
+            created_staging = True
+        return original_mkdtemp(*args, **kwargs)
+
     monkeypatch.setattr(
-        a2v_refresh, "_uses_posix_staging_cleanup", lambda: True, raising=False
+        a2v_refresh, "_windows_staging_runtime_available", lambda: False, raising=False
     )
-    monkeypatch.setattr(
-        a2v_refresh,
-        "_require_posix_fd_cleanup_support",
-        lambda: (_ for _ in ()).throw(
-            ValueError("fd-relative staging cleanup is unavailable")
-        ),
-    )
-    target = _target_run_dir(_refresh_kwargs(ready_source_run, fresh_controls))
-
-    with pytest.raises(ValueError, match="fd-relative staging cleanup is unavailable"):
-        a2v_refresh._create_tracked_staging(target)
-
-    assert not any(path.name.startswith(".a2v-refresh-") for path in target.parent.iterdir())
-
-
-def test_posix_cleanup_support_requires_nonblocking_opens(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import ltx_lora_pilot.a2v_refresh as a2v_refresh
-
-    monkeypatch.setattr(a2v_refresh.os, "O_DIRECTORY", 1, raising=False)
-    monkeypatch.setattr(a2v_refresh.os, "O_NOFOLLOW", 1, raising=False)
-    monkeypatch.delattr(a2v_refresh.os, "O_NONBLOCK", raising=False)
-    monkeypatch.setattr(
-        a2v_refresh.os,
-        "supports_dir_fd",
-        frozenset(
-            {
-                a2v_refresh.os.open,
-                a2v_refresh.os.unlink,
-                a2v_refresh.os.rmdir,
-            }
-        ),
-        raising=False,
-    )
-
-    with pytest.raises(ValueError, match="fd-relative staging cleanup is unavailable"):
-        a2v_refresh._require_posix_fd_cleanup_support()
-
-
-@pytest.mark.skipif(os.name == "nt", reason="requires non-Windows fd-relative cleanup")
-def test_refresh_non_windows_no_replace_failure_cleans_tracked_staging(
-    ready_source_run: ReadySourceRun,
-    fresh_controls: FreshControls,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import ltx_lora_pilot.a2v_refresh as a2v_refresh
-
-    publication_attempted = False
-
-    def unavailable_move(staging: Path, target: Path) -> bool:
-        nonlocal publication_attempted
-        publication_attempted = True
-        return False
-
-    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", unavailable_move)
+    monkeypatch.setattr(a2v_refresh.tempfile, "mkdtemp", record_mkdtemp)
+    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", lambda _s, _t: False)
     kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="Windows"):
         refresh_sealed_a2v_run(**kwargs)
 
-    assert publication_attempted
+    assert not created_staging
     assert not any(
         path.name.startswith(".a2v-refresh-")
         for path in _target_run_dir(kwargs).parent.iterdir()
     )
 
 
-@pytest.mark.skipif(
-    os.name == "nt" or not hasattr(os, "mkfifo"),
-    reason="requires non-Windows FIFO cleanup semantics",
-)
-def test_refresh_non_windows_cleanup_rejects_a_fifo_swap_without_blocking(
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows staging cleanup")
+def test_refresh_rolls_back_empty_staging_when_dacl_normalization_fails(
     ready_source_run: ReadySourceRun,
     fresh_controls: FreshControls,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import ltx_lora_pilot.a2v_refresh as a2v_refresh
 
-    external = ready_source_run.private_root.parent / "fifo-swap-external"
-    external.mkdir()
-    protected = external / "protected.txt"
-    protected.write_bytes(b"external content must survive cleanup")
-    original_walk = a2v_refresh._snapshot_staging_cleanup_tree
-    armed = False
-    swapped = False
+    original_normalize = a2v_refresh._normalize_windows_staging_dacl
 
-    def unavailable_move(staging: Path, target: Path) -> bool:
-        nonlocal armed
-        armed = True
-        return False
+    def fail_for_new_staging(path: Path) -> None:
+        if Path(path).name.startswith(a2v_refresh._STAGING_PREFIX):
+            raise ValueError("injected DACL normalization failure")
+        original_normalize(path)
 
-    def swap_file_for_fifo(
-        root: Path,
-    ) -> tuple[list[Path], list[Path], list[Any]]:
-        nonlocal swapped
-        files, directories, records = original_walk(root)
-        if armed and not swapped:
-            candidate = Path(root) / "candidates" / ready_source_run.candidate_paths[0].name
-            candidate.rename(candidate.with_name("quarantined-candidate.bin"))
-            os.mkfifo(candidate, 0o600)
-            swapped = True
-        return files, directories, records
+    monkeypatch.setattr(
+        a2v_refresh, "_normalize_windows_staging_dacl", fail_for_new_staging
+    )
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
 
-    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", unavailable_move)
-    monkeypatch.setattr(a2v_refresh, "_snapshot_staging_cleanup_tree", swap_file_for_fifo)
+    with pytest.raises(ValueError, match="private staging directory"):
+        refresh_sealed_a2v_run(**kwargs)
 
-    with pytest.raises(ValueError):
-        refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
-
-    assert swapped
-    assert protected.read_bytes() == b"external content must survive cleanup"
+    assert not any(
+        path.name.startswith(".a2v-refresh-")
+        for path in _target_run_dir(kwargs).parent.iterdir()
+    )
 
 
 def test_refresh_rechecks_staged_control_expiry_before_publication(
@@ -1462,7 +1473,28 @@ def test_refresh_output_is_deterministic_for_identical_private_inputs(
     tmp_path: Path,
 ) -> None:
     second_private_root = tmp_path / "second-private"
-    shutil.copytree(ready_source_run.private_root, second_private_root)
+    if os.name == "nt":
+        import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+        second_runs = (
+            second_private_root
+            / "pilots"
+            / ready_source_run.pilot_id
+            / "runs"
+        )
+        second_runs.mkdir(parents=True)
+        a2v_refresh._normalize_windows_staging_dacl(second_runs)
+        shutil.copytree(
+            ready_source_run.run_dir,
+            second_runs / ready_source_run.execution_id,
+        )
+        shutil.copytree(
+            fresh_controls.price_path.parent,
+            second_private_root
+            / fresh_controls.price_path.parent.relative_to(ready_source_run.private_root),
+        )
+    else:
+        shutil.copytree(ready_source_run.private_root, second_private_root)
     second_source = ReadySourceRun(
         private_root=second_private_root,
         pilot_id=ready_source_run.pilot_id,

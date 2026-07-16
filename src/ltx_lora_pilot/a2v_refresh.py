@@ -373,6 +373,8 @@ def copy_accepted_candidates(
                 record,
                 label="accepted source candidate",
             )
+            _normalize_windows_staging_dacl(target / name)
+            _require_normalized_staging_regular_file(target / name)
 
     try:
         copied_entries = list(target.iterdir())
@@ -477,35 +479,68 @@ def _staging_identity(path: Path) -> _StagingIdentity:
     return _StagingIdentity(int(metadata.st_dev), int(metadata.st_ino))
 
 
-def _require_windows_explicit_owner_only_dacl(path: Path) -> None:
-    """Reject an explicit DACL trustee outside the private Windows allowlist."""
+class _WindowsTrusteeW(ctypes.Structure):
+    pass
 
-    if os.name != "nt":
-        return
 
-    class _TrusteeW(ctypes.Structure):
-        pass
+_WindowsTrusteeW._fields_ = [
+    ("multiple_trustee", ctypes.POINTER(_WindowsTrusteeW)),
+    ("multiple_trustee_operation", wintypes.DWORD),
+    ("trustee_form", wintypes.DWORD),
+    ("trustee_type", wintypes.DWORD),
+    ("name", ctypes.c_void_p),
+]
 
-    _TrusteeW._fields_ = [
-        ("multiple_trustee", ctypes.POINTER(_TrusteeW)),
-        ("multiple_trustee_operation", wintypes.DWORD),
-        ("trustee_form", wintypes.DWORD),
-        ("trustee_type", wintypes.DWORD),
-        ("name", ctypes.c_void_p),
+
+class _WindowsExplicitAccessW(ctypes.Structure):
+    _fields_ = [
+        ("access_permissions", wintypes.DWORD),
+        ("access_mode", wintypes.DWORD),
+        ("inheritance", wintypes.DWORD),
+        ("trustee", _WindowsTrusteeW),
     ]
 
-    class _ExplicitAccessW(ctypes.Structure):
-        _fields_ = [
-            ("access_permissions", wintypes.DWORD),
-            ("access_mode", wintypes.DWORD),
-            ("inheritance", wintypes.DWORD),
-            ("trustee", _TrusteeW),
-        ]
 
-    local_free: Any | None = None
-    descriptor = ctypes.c_void_p()
-    entries = ctypes.POINTER(_ExplicitAccessW)()
-    trusted_sids: list[ctypes.c_void_p] = []
+class _WindowsAceHeader(ctypes.Structure):
+    _fields_ = [
+        ("ace_type", ctypes.c_ubyte),
+        ("ace_flags", ctypes.c_ubyte),
+        ("ace_size", ctypes.c_ushort),
+    ]
+
+
+class _WindowsAccessAllowedAce(ctypes.Structure):
+    _fields_ = [
+        ("header", _WindowsAceHeader),
+        ("access_mask", wintypes.DWORD),
+        ("sid_start", wintypes.DWORD),
+    ]
+
+
+class _WindowsAclSizeInformation(ctypes.Structure):
+    _fields_ = [
+        ("ace_count", wintypes.DWORD),
+        ("acl_bytes_in_use", wintypes.DWORD),
+        ("acl_bytes_free", wintypes.DWORD),
+    ]
+
+
+_WINDOWS_SE_FILE_OBJECT = 1
+_WINDOWS_OWNER_SECURITY_INFORMATION = 0x00000001
+_WINDOWS_DACL_SECURITY_INFORMATION = 0x00000004
+_WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
+_WINDOWS_SE_DACL_PRESENT = 0x0004
+_WINDOWS_SE_DACL_PROTECTED = 0x1000
+_WINDOWS_ACL_SIZE_INFORMATION = 2
+_WINDOWS_ACCESS_ALLOWED_ACE_TYPE = 0
+_WINDOWS_TRUSTEE_IS_SID = 0
+_WINDOWS_TRUSTEE_IS_UNKNOWN = 0
+_WINDOWS_GRANT_ACCESS = 1
+_WINDOWS_FILE_ALL_ACCESS = 0x001F01FF
+_WINDOWS_SID_MINIMUM_SIZE = 8
+
+
+def _windows_dacl_api() -> dict[str, Any]:
     try:
         advapi32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
         kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
@@ -521,13 +556,6 @@ def _require_windows_explicit_owner_only_dacl(path: Path) -> None:
             ctypes.POINTER(ctypes.c_void_p),
         ]
         get_security.restype = wintypes.DWORD
-        get_explicit_entries = advapi32.GetExplicitEntriesFromAclW
-        get_explicit_entries.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(wintypes.ULONG),
-            ctypes.POINTER(ctypes.POINTER(_ExplicitAccessW)),
-        ]
-        get_explicit_entries.restype = wintypes.DWORD
         equal_sid = advapi32.EqualSid
         equal_sid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         equal_sid.restype = wintypes.BOOL
@@ -537,69 +565,334 @@ def _require_windows_explicit_owner_only_dacl(path: Path) -> None:
             ctypes.POINTER(ctypes.c_void_p),
         ]
         convert_string_sid.restype = wintypes.BOOL
+        get_security_descriptor_control = advapi32.GetSecurityDescriptorControl
+        get_security_descriptor_control.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.WORD),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        get_security_descriptor_control.restype = wintypes.BOOL
+        is_valid_security_descriptor = advapi32.IsValidSecurityDescriptor
+        is_valid_security_descriptor.argtypes = [ctypes.c_void_p]
+        is_valid_security_descriptor.restype = wintypes.BOOL
+        is_valid_acl = advapi32.IsValidAcl
+        is_valid_acl.argtypes = [ctypes.c_void_p]
+        is_valid_acl.restype = wintypes.BOOL
+        get_acl_information = advapi32.GetAclInformation
+        get_acl_information.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        ]
+        get_acl_information.restype = wintypes.BOOL
+        get_ace = advapi32.GetAce
+        get_ace.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        get_ace.restype = wintypes.BOOL
+        is_valid_sid = advapi32.IsValidSid
+        is_valid_sid.argtypes = [ctypes.c_void_p]
+        is_valid_sid.restype = wintypes.BOOL
+        get_length_sid = advapi32.GetLengthSid
+        get_length_sid.argtypes = [ctypes.c_void_p]
+        get_length_sid.restype = wintypes.DWORD
+        set_entries_in_acl = advapi32.SetEntriesInAclW
+        set_entries_in_acl.argtypes = [
+            wintypes.ULONG,
+            ctypes.POINTER(_WindowsExplicitAccessW),
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        set_entries_in_acl.restype = wintypes.DWORD
+        set_named_security = advapi32.SetNamedSecurityInfoW
+        set_named_security.argtypes = [
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        set_named_security.restype = wintypes.DWORD
         local_free = kernel32.LocalFree
         local_free.argtypes = [ctypes.c_void_p]
         local_free.restype = ctypes.c_void_p
-
-        owner = ctypes.c_void_p()
-        dacl = ctypes.c_void_p()
-        status = get_security(
-            str(path),
-            1,  # SE_FILE_OBJECT
-            0x00000001 | 0x00000004,  # OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
-            ctypes.byref(owner),
-            None,
-            ctypes.byref(dacl),
-            None,
-            ctypes.byref(descriptor),
-        )
-        if status != 0 or not owner.value or not dacl.value or not descriptor.value:
-            raise ValueError("private path DACL is unavailable")
-
-        # CPython creates 0o700/0o600 Windows DACLs with these OS recovery
-        # principals. They do not grant access to an arbitrary user: OWNER
-        # RIGHTS resolves only to the owner, and SYSTEM/Administrators are
-        # privileged local recovery identities.
-        for sid_text in ("S-1-5-18", "S-1-5-32-544", "S-1-3-4"):
-            sid = ctypes.c_void_p()
-            if not convert_string_sid(sid_text, ctypes.byref(sid)) or not sid.value:
-                raise ValueError("private path DACL is unavailable")
-            trusted_sids.append(sid)
-
-        entry_count = wintypes.ULONG()
-        status = get_explicit_entries(
-            dacl, ctypes.byref(entry_count), ctypes.byref(entries)
-        )
-        if status != 0 or (entry_count.value and not entries):
-            raise ValueError("private path DACL is unavailable")
-        for entry in entries[: entry_count.value]:
-            trustee = entry.trustee
-            if (
-                trustee.multiple_trustee
-                or trustee.trustee_form != 0  # TRUSTEE_IS_SID
-                or not trustee.name
-                or not (
-                    equal_sid(owner, ctypes.c_void_p(trustee.name))
-                    or any(
-                        equal_sid(trusted, ctypes.c_void_p(trustee.name))
-                        for trusted in trusted_sids
-                    )
-                )
-            ):
-                raise ValueError("private path DACL has an untrusted explicit ACE")
     except (AttributeError, OSError) as exc:
         raise ValueError("private path DACL is unavailable") from exc
+    return {
+        "convert_string_sid": convert_string_sid,
+        "equal_sid": equal_sid,
+        "get_ace": get_ace,
+        "get_acl_information": get_acl_information,
+        "get_length_sid": get_length_sid,
+        "get_security": get_security,
+        "get_security_descriptor_control": get_security_descriptor_control,
+        "is_valid_security_descriptor": is_valid_security_descriptor,
+        "is_valid_acl": is_valid_acl,
+        "is_valid_sid": is_valid_sid,
+        "local_free": local_free,
+        "set_entries_in_acl": set_entries_in_acl,
+        "set_named_security": set_named_security,
+    }
+
+
+def _windows_recovery_sids(api: Mapping[str, Any]) -> list[ctypes.c_void_p]:
+    trusted_sids: list[ctypes.c_void_p] = []
+    try:
+        for sid_text in ("S-1-5-18", "S-1-5-32-544", "S-1-3-4"):
+            sid = ctypes.c_void_p()
+            if not api["convert_string_sid"](sid_text, ctypes.byref(sid)) or not sid.value:
+                raise ValueError("private path DACL is unavailable")
+            trusted_sids.append(sid)
+        return trusted_sids
+    except Exception:
+        for sid in trusted_sids:
+            api["local_free"](sid)
+        raise
+
+
+def _free_windows_dacl_snapshot(
+    api: Mapping[str, Any], descriptor: ctypes.c_void_p
+) -> None:
+    if descriptor.value:
+        api["local_free"](descriptor)
+
+
+def _get_windows_dacl_snapshot(
+    path: Path, api: Mapping[str, Any]
+) -> tuple[ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]:
+    owner = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = api["get_security"](
+        str(path),
+        _WINDOWS_SE_FILE_OBJECT,
+        _WINDOWS_OWNER_SECURITY_INFORMATION | _WINDOWS_DACL_SECURITY_INFORMATION,
+        ctypes.byref(owner),
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0 or not owner.value or not dacl.value or not descriptor.value:
+        _free_windows_dacl_snapshot(api, descriptor)
+        raise ValueError("private path DACL is unavailable")
+    return owner, dacl, descriptor
+
+
+def _windows_sid_is_allowed(
+    api: Mapping[str, Any], sid: ctypes.c_void_p, allowed_sids: list[ctypes.c_void_p]
+) -> bool:
+    return any(api["equal_sid"](candidate, sid) for candidate in allowed_sids)
+
+
+def _unique_windows_sids(
+    api: Mapping[str, Any], sids: list[ctypes.c_void_p]
+) -> list[ctypes.c_void_p]:
+    result: list[ctypes.c_void_p] = []
+    for sid in sids:
+        if not _windows_sid_is_allowed(api, sid, result):
+            result.append(sid)
+    return result
+
+
+def _windows_sid_index(
+    api: Mapping[str, Any], sid: ctypes.c_void_p, expected: list[ctypes.c_void_p]
+) -> int | None:
+    for index, candidate in enumerate(expected):
+        if api["equal_sid"](candidate, sid):
+            return index
+    return None
+
+
+def _windows_access_allowed_ace(
+    api: Mapping[str, Any], ace: ctypes.c_void_p, *, exact_size: bool
+) -> tuple[_WindowsAceHeader, int, ctypes.c_void_p]:
+    """Read one bounded, basic allow ACE without trusting inherited metadata."""
+
+    header = ctypes.cast(ace, ctypes.POINTER(_WindowsAceHeader)).contents
+    sid_offset = _WindowsAccessAllowedAce.sid_start.offset
+    if (
+        header.ace_type != _WINDOWS_ACCESS_ALLOWED_ACE_TYPE
+        or header.ace_size < sid_offset + _WINDOWS_SID_MINIMUM_SIZE
+    ):
+        raise ValueError("private path DACL has an untrusted ACE")
+    access = ctypes.cast(ace, ctypes.POINTER(_WindowsAccessAllowedAce)).contents
+    sid = ctypes.c_void_p(int(ace.value) + sid_offset)
+    sid_prefix = ctypes.cast(sid, ctypes.POINTER(ctypes.c_ubyte * 2)).contents
+    if sid_prefix[0] != 1:
+        raise ValueError("private path DACL is invalid")
+    sid_length = _WINDOWS_SID_MINIMUM_SIZE + 4 * int(sid_prefix[1])
+    if sid_offset + sid_length > header.ace_size:
+        raise ValueError("private path DACL is invalid")
+    if not api["is_valid_sid"](sid) or api["get_length_sid"](sid) != sid_length:
+        raise ValueError("private path DACL is invalid")
+    if exact_size and sid_offset + sid_length != header.ace_size:
+        raise ValueError("private path DACL is not normalized")
+    return header, int(access.access_mask), sid
+
+
+def _require_windows_private_dacl(path: Path) -> None:
+    """Reject every Windows DACL trustee outside the private allowlist."""
+
+    if os.name != "nt":
+        return
+    api = _windows_dacl_api()
+    descriptor = ctypes.c_void_p()
+    trusted_sids: list[ctypes.c_void_p] = []
+    try:
+        owner, dacl, descriptor = _get_windows_dacl_snapshot(path, api)
+        trusted_sids = _windows_recovery_sids(api)
+        allowed_sids = _unique_windows_sids(api, [owner, *trusted_sids])
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not api["get_security_descriptor_control"](
+            descriptor, ctypes.byref(control), ctypes.byref(revision)
+        ) or not (control.value & _WINDOWS_SE_DACL_PRESENT):
+            raise ValueError("private path DACL is unavailable")
+        if not api["is_valid_security_descriptor"](descriptor) or not api[
+            "is_valid_acl"
+        ](dacl):
+            raise ValueError("private path DACL is invalid")
+        information = _WindowsAclSizeInformation()
+        if not api["get_acl_information"](
+            dacl,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+            _WINDOWS_ACL_SIZE_INFORMATION,
+        ):
+            raise ValueError("private path DACL is unavailable")
+        for index in range(information.ace_count):
+            ace = ctypes.c_void_p()
+            if not api["get_ace"](dacl, index, ctypes.byref(ace)) or not ace.value:
+                raise ValueError("private path DACL is unavailable")
+            _header, _access_mask, sid = _windows_access_allowed_ace(
+                api, ace, exact_size=False
+            )
+            if not _windows_sid_is_allowed(api, sid, allowed_sids):
+                raise ValueError("private path DACL has an untrusted ACE")
     finally:
-        if local_free is not None and entries:
-            local_free(ctypes.cast(entries, ctypes.c_void_p))
-        if local_free is not None:
-            for sid in trusted_sids:
-                local_free(sid)
-        if local_free is not None and descriptor.value:
-            local_free(descriptor)
+        for sid in trusted_sids:
+            api["local_free"](sid)
+        _free_windows_dacl_snapshot(api, descriptor)
 
 
-def _require_staging_directory(path: Path) -> None:
+def _require_windows_explicit_owner_only_dacl(path: Path) -> None:
+    """Require the complete protected staging DACL, including inherited ACEs."""
+
+    if os.name != "nt":
+        return
+    api = _windows_dacl_api()
+    descriptor = ctypes.c_void_p()
+    trusted_sids: list[ctypes.c_void_p] = []
+    try:
+        owner, dacl, descriptor = _get_windows_dacl_snapshot(path, api)
+        trusted_sids = _windows_recovery_sids(api)
+        allowed_sids = _unique_windows_sids(api, [owner, *trusted_sids])
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not api["get_security_descriptor_control"](
+            descriptor, ctypes.byref(control), ctypes.byref(revision)
+        ) or (control.value & (_WINDOWS_SE_DACL_PRESENT | _WINDOWS_SE_DACL_PROTECTED)) != (
+            _WINDOWS_SE_DACL_PRESENT | _WINDOWS_SE_DACL_PROTECTED
+        ):
+            raise ValueError("private path DACL is not protected")
+        if not api["is_valid_security_descriptor"](descriptor) or not api[
+            "is_valid_acl"
+        ](dacl):
+            raise ValueError("private path DACL is invalid")
+        information = _WindowsAclSizeInformation()
+        if not api["get_acl_information"](
+            dacl,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+            _WINDOWS_ACL_SIZE_INFORMATION,
+        ):
+            raise ValueError("private path DACL is unavailable")
+        if information.ace_count != len(allowed_sids):
+            raise ValueError("private path DACL is not normalized")
+        observed = [False] * len(allowed_sids)
+        for index in range(information.ace_count):
+            ace = ctypes.c_void_p()
+            if not api["get_ace"](dacl, index, ctypes.byref(ace)) or not ace.value:
+                raise ValueError("private path DACL is unavailable")
+            header, access_mask, sid = _windows_access_allowed_ace(
+                api, ace, exact_size=True
+            )
+            if header.ace_flags != 0:
+                raise ValueError("private path DACL is not normalized")
+            if access_mask != _WINDOWS_FILE_ALL_ACCESS:
+                raise ValueError("private path DACL is not normalized")
+            sid_index = _windows_sid_index(api, sid, allowed_sids)
+            if sid_index is None or observed[sid_index]:
+                raise ValueError("private path DACL has an untrusted ACE")
+            observed[sid_index] = True
+        if not all(observed):
+            raise ValueError("private path DACL is not normalized")
+    finally:
+        for sid in trusted_sids:
+            api["local_free"](sid)
+        _free_windows_dacl_snapshot(api, descriptor)
+
+
+def _normalize_windows_staging_dacl(path: Path) -> None:
+    """Replace a new staging node DACL with the protected trusted-principal ACL."""
+
+    if os.name != "nt":
+        return
+    api = _windows_dacl_api()
+    descriptor = ctypes.c_void_p()
+    normalized_dacl = ctypes.c_void_p()
+    trusted_sids: list[ctypes.c_void_p] = []
+    try:
+        owner, _dacl, descriptor = _get_windows_dacl_snapshot(path, api)
+        trusted_sids = _windows_recovery_sids(api)
+        trustees = _unique_windows_sids(api, [owner, *trusted_sids])
+        entries = (_WindowsExplicitAccessW * len(trustees))()
+        for index, trustee in enumerate(trustees):
+            entries[index] = _WindowsExplicitAccessW(
+                _WINDOWS_FILE_ALL_ACCESS,
+                _WINDOWS_GRANT_ACCESS,
+                0,
+                _WindowsTrusteeW(
+                    None,
+                    0,
+                    _WINDOWS_TRUSTEE_IS_SID,
+                    _WINDOWS_TRUSTEE_IS_UNKNOWN,
+                    trustee,
+                ),
+            )
+        status = api["set_entries_in_acl"](
+            len(entries), entries, None, ctypes.byref(normalized_dacl)
+        )
+        if status != 0 or not normalized_dacl.value:
+            raise ValueError("private path DACL cannot be normalized")
+        status = api["set_named_security"](
+            str(path),
+            _WINDOWS_SE_FILE_OBJECT,
+            _WINDOWS_DACL_SECURITY_INFORMATION
+            | _WINDOWS_PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            normalized_dacl,
+            None,
+        )
+        if status != 0:
+            raise ValueError("private path DACL cannot be normalized")
+    finally:
+        if normalized_dacl.value:
+            api["local_free"](normalized_dacl)
+        for sid in trusted_sids:
+            api["local_free"](sid)
+        _free_windows_dacl_snapshot(api, descriptor)
+    _require_windows_explicit_owner_only_dacl(path)
+
+
+def _require_staging_directory_metadata(path: Path) -> Path:
     candidate = Path(path)
     try:
         metadata = candidate.lstat()
@@ -609,14 +902,19 @@ def _require_staging_directory(path: Path) -> None:
         raise ValueError("staging directory is invalid")
     if os.name != "nt" and stat.S_IMODE(metadata.st_mode) != 0o700:
         raise ValueError("staging directory is not owner-only")
+    return candidate
+
+
+def _require_staging_directory(path: Path) -> None:
+    candidate = _require_staging_directory_metadata(path)
     try:
         _preflight._WINDOWS_DACL_CHECK(candidate)
-        _require_windows_explicit_owner_only_dacl(candidate)
+        _require_windows_private_dacl(candidate)
     except Exception:
         raise ValueError("staging directory is not private") from None
 
 
-def _require_staging_regular_file(path: Path) -> os.stat_result:
+def _require_staging_regular_file_metadata(path: Path) -> tuple[Path, os.stat_result]:
     candidate = Path(path)
     try:
         metadata = candidate.lstat()
@@ -630,8 +928,30 @@ def _require_staging_regular_file(path: Path) -> os.stat_result:
         raise ValueError("staging file is invalid")
     if os.name != "nt" and stat.S_IMODE(metadata.st_mode) & 0o077:
         raise ValueError("staging file is not owner-only")
+    return candidate, metadata
+
+
+def _require_staging_regular_file(path: Path) -> os.stat_result:
+    candidate, metadata = _require_staging_regular_file_metadata(path)
     try:
         _preflight._WINDOWS_DACL_CHECK(candidate)
+        _require_windows_private_dacl(candidate)
+    except Exception:
+        raise ValueError("staging file is not private") from None
+    return metadata
+
+
+def _require_normalized_staging_directory(path: Path) -> None:
+    candidate = _require_staging_directory_metadata(path)
+    try:
+        _require_windows_explicit_owner_only_dacl(candidate)
+    except Exception:
+        raise ValueError("staging directory is not private") from None
+
+
+def _require_normalized_staging_regular_file(path: Path) -> os.stat_result:
+    candidate, metadata = _require_staging_regular_file_metadata(path)
+    try:
         _require_windows_explicit_owner_only_dacl(candidate)
     except Exception:
         raise ValueError("staging file is not private") from None
@@ -949,122 +1269,11 @@ def _verify_handle_staging_identity(
         raise ValueError("tracked staging entry changed")
 
 
-def _uses_posix_staging_cleanup() -> bool:
-    return os.name != "nt"
-
-
-def _require_posix_fd_cleanup_support() -> None:
-    """Fail closed unless cleanup can keep every deletion below an open parent."""
-
-    supported = getattr(os, "supports_dir_fd", frozenset())
-    if (
-        not getattr(os, "O_DIRECTORY", 0)
-        or not getattr(os, "O_NOFOLLOW", 0)
-        or not getattr(os, "O_NONBLOCK", 0)
-        or os.open not in supported
-        or os.unlink not in supported
-        or os.rmdir not in supported
-    ):
-        raise ValueError("fd-relative staging cleanup is unavailable")
-
-
-def _verify_posix_staging_descriptor_identity(
-    descriptor: int,
-    expected: _StagingIdentity | _PrivateFileIdentity,
-    *,
-    directory: bool,
-) -> None:
-    try:
-        metadata = os.fstat(descriptor)
-    except OSError as exc:
-        raise ValueError("tracked staging entry is unavailable") from exc
-    if directory:
-        actual: _StagingIdentity | _PrivateFileIdentity = _StagingIdentity(
-            int(metadata.st_dev), int(metadata.st_ino)
-        )
-        valid = (
-            stat.S_ISDIR(metadata.st_mode)
-            and stat.S_IMODE(metadata.st_mode) == 0o700
-        )
-    else:
-        actual = _file_identity_from_metadata(metadata)
-        valid = (
-            stat.S_ISREG(metadata.st_mode)
-            and metadata.st_nlink == 1
-            and not (stat.S_IMODE(metadata.st_mode) & 0o077)
-        )
-    if not valid or actual != expected:
-        raise ValueError("tracked staging entry changed")
-
-
-def _staging_cleanup_entry_name(path: Path, parent: Path) -> str:
-    candidate = Path(path)
-    name = candidate.name
-    if (
-        candidate.parent != Path(parent)
-        or not name
-        or name in {".", ".."}
-        or Path(name).name != name
-        or ":" in name
-    ):
-        raise ValueError("tracked staging entry is invalid")
-    return name
-
-
-def _open_posix_staging_directory(
-    path: Path, expected: _StagingIdentity
-) -> int:
-    _require_posix_fd_cleanup_support()
-    flags = (
-        os.O_RDONLY
-        | os.O_DIRECTORY
-        | os.O_NOFOLLOW
-        | getattr(os, "O_NONBLOCK", 0)
-    )
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise ValueError("tracked staging directory cannot be opened safely") from exc
-    try:
-        _verify_posix_staging_descriptor_identity(
-            descriptor, expected, directory=True
-        )
-    except Exception:
-        os.close(descriptor)
-        raise
-    return descriptor
-
-
-def _open_posix_staging_entry(
-    parent_descriptor: int,
-    name: str,
-    expected: _StagingIdentity | _PrivateFileIdentity,
-    *,
-    directory: bool,
-) -> int:
-    _require_posix_fd_cleanup_support()
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
-    if directory:
-        flags |= os.O_DIRECTORY
-    try:
-        descriptor = os.open(name, flags, dir_fd=parent_descriptor)
-    except OSError as exc:
-        raise ValueError("tracked staging entry cannot be opened safely") from exc
-    try:
-        _verify_posix_staging_descriptor_identity(
-            descriptor, expected, directory=directory
-        )
-    except Exception:
-        os.close(descriptor)
-        raise
-    return descriptor
-
-
 def _write_new_private_file(path: Path, content: bytes) -> None:
     destination = Path(path)
     if not isinstance(content, bytes):
         raise TypeError("private file content is invalid")
-    _require_staging_directory(destination.parent)
+    _require_normalized_staging_directory(destination.parent)
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -1089,7 +1298,8 @@ def _write_new_private_file(path: Path, content: bytes) -> None:
         os.chmod(destination, 0o400)
     except OSError as exc:
         raise ValueError("staging file permissions cannot be set") from exc
-    _require_staging_regular_file(destination)
+    _normalize_windows_staging_dacl(destination)
+    _require_normalized_staging_regular_file(destination)
 
 
 def _write_new_canonical_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -1097,7 +1307,7 @@ def _write_new_canonical_json(path: Path, value: Mapping[str, Any]) -> None:
 
 
 def _load_canonical_staged_object(path: Path, *, label: str) -> dict[str, Any]:
-    _require_staging_regular_file(path)
+    _require_normalized_staging_regular_file(path)
     try:
         content = Path(path).read_bytes()
         value = strict_load_json(path)
@@ -1136,7 +1346,8 @@ def _copy_fresh_controls(
             label=label,
         )
         _verify_fresh_control_snapshot(private_root, snapshot)
-        _require_staging_regular_file(destination)
+        _normalize_windows_staging_dacl(destination)
+        _require_normalized_staging_regular_file(destination)
         return destination
 
     snapshots = (price_snapshot, policy_snapshot, prompts_snapshot)
@@ -1330,13 +1541,13 @@ def _walk_staging_tree(
     root: Path, *, capture_file_identities: bool
 ) -> tuple[list[Path], list[Path], list[_TrackedStagingFile]]:
     root = Path(root)
-    _require_staging_directory(root)
+    _require_normalized_staging_directory(root)
     files: list[Path] = []
     directories: list[Path] = []
     file_records: list[_TrackedStagingFile] = []
 
     def visit(directory: Path) -> None:
-        _require_staging_directory(directory)
+        _require_normalized_staging_directory(directory)
         directories.append(directory)
         try:
             entries = sorted(os.scandir(directory), key=lambda item: item.name)
@@ -1362,7 +1573,7 @@ def _walk_staging_tree(
             if stat.S_ISDIR(metadata.st_mode):
                 visit(child)
             elif stat.S_ISREG(metadata.st_mode):
-                file_metadata = _require_staging_regular_file(child)
+                file_metadata = _require_normalized_staging_regular_file(child)
                 files.append(child)
                 if capture_file_identities:
                     file_records.append(
@@ -1558,7 +1769,7 @@ def _verify_tracked_staging_directories(
         raise ValueError("tracked staging root is invalid")
     for original, expected in staging.directories.items():
         current = _tracked_directory_at(staging, original, current_root)
-        _require_staging_directory(current)
+        _require_normalized_staging_directory(current)
         if _staging_identity(current) != expected:
             raise ValueError("tracked staging directory changed")
 
@@ -1627,83 +1838,27 @@ def _remove_windows_tracked_staging_directory(
         parent_handle.close()
 
 
-def _remove_posix_tracked_staging_file(
-    staging: _TrackedStaging, record: _TrackedStagingFile
-) -> None:
-    parent = record.path.parent
-    expected_parent = staging.directories.get(parent)
-    if expected_parent is None:
-        raise ValueError("staging file parent is untracked")
-    name = _staging_cleanup_entry_name(record.path, parent)
-    parent_descriptor = _open_posix_staging_directory(parent, expected_parent)
-    file_descriptor: int | None = None
-    try:
-        file_descriptor = _open_posix_staging_entry(
-            parent_descriptor, name, record.identity, directory=False
-        )
-        os.unlink(name, dir_fd=parent_descriptor)
-    except OSError as exc:
-        raise ValueError("tracked staging entry cannot be removed safely") from exc
-    finally:
-        if file_descriptor is not None:
-            os.close(file_descriptor)
-        os.close(parent_descriptor)
-
-
-def _remove_posix_tracked_staging_directory(
-    staging: _TrackedStaging, directory: Path
-) -> None:
-    target = Path(directory)
-    expected_target = staging.directories.get(target)
-    if expected_target is None:
-        raise ValueError("staging directory is untracked")
-    if target == staging.path:
-        parent = staging.parent
-        expected_parent = staging.parent_identity
-    else:
-        parent = target.parent
-        expected_parent = staging.directories.get(parent)
-        if expected_parent is None:
-            raise ValueError("staging directory parent is untracked")
-    name = _staging_cleanup_entry_name(target, parent)
-    parent_descriptor = _open_posix_staging_directory(parent, expected_parent)
-    target_descriptor: int | None = None
-    try:
-        target_descriptor = _open_posix_staging_entry(
-            parent_descriptor, name, expected_target, directory=True
-        )
-        os.rmdir(name, dir_fd=parent_descriptor)
-    except OSError as exc:
-        raise ValueError("tracked staging entry cannot be removed safely") from exc
-    finally:
-        if target_descriptor is not None:
-            os.close(target_descriptor)
-        os.close(parent_descriptor)
-
-
 def _remove_tracked_staging_file(
     staging: _TrackedStaging, record: _TrackedStagingFile
 ) -> None:
-    if os.name == "nt":
-        _remove_windows_tracked_staging_file(staging, record)
-    else:
-        _remove_posix_tracked_staging_file(staging, record)
+    if os.name != "nt":
+        raise ValueError("handle-bound staging cleanup requires Windows")
+    _remove_windows_tracked_staging_file(staging, record)
 
 
 def _remove_tracked_staging_directory(
     staging: _TrackedStaging, directory: Path
 ) -> None:
-    if os.name == "nt":
-        _remove_windows_tracked_staging_directory(staging, directory)
-    else:
-        _remove_posix_tracked_staging_directory(staging, directory)
+    if os.name != "nt":
+        raise ValueError("handle-bound staging cleanup requires Windows")
+    _remove_windows_tracked_staging_directory(staging, directory)
 
 
 def _remove_staged_prompt_file(path: Path, staging: _TrackedStaging) -> None:
     candidate = Path(path)
     if candidate.parent != staging.path / "validation":
         raise ValueError("staged prompt file is invalid")
-    metadata = _require_staging_regular_file(candidate)
+    metadata = _require_normalized_staging_regular_file(candidate)
     _remove_tracked_staging_file(
         staging,
         _TrackedStagingFile(
@@ -1713,23 +1868,48 @@ def _remove_staged_prompt_file(path: Path, staging: _TrackedStaging) -> None:
     )
 
 
+def _windows_staging_runtime_available() -> bool:
+    """Fresh issuer staging relies on Windows handle-bound cleanup and MoveFileExW."""
+
+    return os.name == "nt"
+
+
 def _create_tracked_staging(target: Path) -> _TrackedStaging:
+    if not _windows_staging_runtime_available():
+        raise ValueError("fresh A2V staging requires Windows no-replace publication")
     destination = Path(target)
     parent = destination.parent
-    if _uses_posix_staging_cleanup():
-        _require_posix_fd_cleanup_support()
-    _require_staging_directory(parent)
+    _require_normalized_staging_directory(parent)
     if _has_alias_component(parent) or _has_case_alias(parent):
         raise ValueError("canonical runs directory is required")
+    parent_identity = _staging_identity(parent)
+    path: Path | None = None
+    identity: _StagingIdentity | None = None
     try:
         path = Path(tempfile.mkdtemp(prefix=_STAGING_PREFIX, dir=parent))
-        if os.name != "nt":
-            os.chmod(path, 0o700)
-        _require_staging_directory(path)
+        if path.parent != parent:
+            raise ValueError("private staging directory is invalid")
+        identity = _staging_identity(path)
+        _normalize_windows_staging_dacl(path)
+        _require_normalized_staging_directory(path)
     except Exception:
+        if path is not None and identity is not None:
+            rollback = _TrackedStaging(
+                path=path,
+                parent=parent,
+                parent_identity=parent_identity,
+                identity=identity,
+                directories={path: identity},
+            )
+            try:
+                _remove_windows_tracked_staging_directory(rollback, path)
+            except Exception:
+                raise ValueError(
+                    "private staging directory cannot be safely removed"
+                ) from None
         raise ValueError("private staging directory cannot be created") from None
-    parent_identity = _staging_identity(parent)
-    identity = _staging_identity(path)
+    if path is None or identity is None:
+        raise ValueError("private staging directory cannot be created")
     return _TrackedStaging(
         path=path,
         parent=parent,
@@ -1747,6 +1927,7 @@ def _cleanup_tracked_staging(staging: _TrackedStaging) -> None:
         or _has_case_alias(staging.parent)
     ):
         raise ValueError("tracked staging directory changed")
+    _require_normalized_staging_directory(staging.parent)
     _verify_tracked_staging_directories(staging, current_root=path)
     _files, directories, file_records = _snapshot_staging_cleanup_tree(path)
     if set(directories) != set(staging.directories):
@@ -1819,8 +2000,8 @@ def _publish_new_run_no_replace(
         or staged == destination
     ):
         raise ValueError("publication paths are invalid")
-    _require_staging_directory(staged.parent)
-    _require_staging_directory(staged)
+    _require_normalized_staging_directory(staged.parent)
+    _require_normalized_staging_directory(staged)
     staged_identity = _staging_identity(staged)
     if tracked.path != staged or tracked.parent != staged.parent:
         raise ValueError("tracked staging path changed")
@@ -1846,7 +2027,7 @@ def _publish_new_run_no_replace(
     # The context manager must never clean an ambiguous post-move target.
     tracked.published = True
     try:
-        _require_staging_directory(destination)
+        _require_normalized_staging_directory(destination)
         if _staging_identity(destination) != staged_identity:
             raise ValueError("new target directory changed after publication")
         _verify_tracked_staging_directories(tracked, current_root=destination)
@@ -1880,6 +2061,8 @@ def refresh_sealed_a2v_run(
 ) -> FreshA2VRunResult:
     """Build and publish one fresh, immutable A2V target without paid execution."""
 
+    if not _windows_staging_runtime_available():
+        raise ValueError("fresh A2V staging requires Windows no-replace publication")
     snapshot = verify_source_run_static(
         private_root=private_root,
         pilot_id=pilot_id,
@@ -1895,11 +2078,10 @@ def refresh_sealed_a2v_run(
             path = staging / directory
             try:
                 path.mkdir(mode=0o700)
-                if os.name != "nt":
-                    os.chmod(path, 0o700)
             except OSError as exc:
                 raise ValueError("private staging layout cannot be created") from exc
-            _require_staging_directory(path)
+            _normalize_windows_staging_dacl(path)
+            _require_normalized_staging_directory(path)
             tracked.directories[path] = _staging_identity(path)
 
         staged_price, staged_policy, staged_prompts = _copy_fresh_controls(
@@ -1925,6 +2107,8 @@ def refresh_sealed_a2v_run(
         groups = _resolved_staged_groups(structural, quality_summary, staging / "candidates")
         archive_path = staging / "bundle" / "training-data.zip"
         archive_digest = build_training_archive(groups, archive_path)
+        _normalize_windows_staging_dacl(archive_path)
+        _require_normalized_staging_regular_file(archive_path)
         dataset = build_dataset_manifest(
             structural,
             attestation,
