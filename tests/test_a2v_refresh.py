@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 from typing import Any
 import zipfile
 
@@ -474,6 +475,39 @@ def fresh_controls(ready_source_run: ReadySourceRun) -> FreshControls:
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows DACL semantics")
+@pytest.mark.parametrize("kind", ["directory", "file"])
+def test_staging_privacy_rejects_explicit_nonowner_windows_ace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """The broad preflight guard must not be the sole Windows ACL gate."""
+
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    candidate = tmp_path / f"named-ace-{kind}"
+    if kind == "directory":
+        candidate.mkdir()
+        require_private = a2v_refresh._require_staging_directory
+    else:
+        candidate.write_bytes(b"private")
+        require_private = a2v_refresh._require_staging_regular_file
+    granted = subprocess.run(
+        ["icacls", str(candidate), "/grant", "*S-1-5-32-545:(X)"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert granted.returncode == 0, granted.stdout + granted.stderr
+    # Permit the existing broad check so this test specifically exercises the
+    # required owner-SID comparison for the explicit BUILTIN\\Users ACE.
+    monkeypatch.setattr(a2v_refresh._preflight, "_WINDOWS_DACL_CHECK", lambda _path: None)
+
+    with pytest.raises(ValueError, match="not private"):
+        require_private(candidate)
+
+
 def _refresh_kwargs(ready_source_run: ReadySourceRun, fresh_controls: FreshControls) -> dict[str, Any]:
     return {
         "private_root": ready_source_run.private_root,
@@ -938,6 +972,130 @@ def test_refresh_fails_closed_when_no_replace_primitive_is_unavailable(
         refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
 
     assert not _target_run_dir(_refresh_kwargs(ready_source_run, fresh_controls)).exists()
+
+
+def test_refresh_refuses_staging_before_posix_cleanup_support_is_available(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    monkeypatch.setattr(
+        a2v_refresh, "_uses_posix_staging_cleanup", lambda: True, raising=False
+    )
+    monkeypatch.setattr(
+        a2v_refresh,
+        "_require_posix_fd_cleanup_support",
+        lambda: (_ for _ in ()).throw(
+            ValueError("fd-relative staging cleanup is unavailable")
+        ),
+    )
+    target = _target_run_dir(_refresh_kwargs(ready_source_run, fresh_controls))
+
+    with pytest.raises(ValueError, match="fd-relative staging cleanup is unavailable"):
+        a2v_refresh._create_tracked_staging(target)
+
+    assert not any(path.name.startswith(".a2v-refresh-") for path in target.parent.iterdir())
+
+
+def test_posix_cleanup_support_requires_nonblocking_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    monkeypatch.setattr(a2v_refresh.os, "O_DIRECTORY", 1, raising=False)
+    monkeypatch.setattr(a2v_refresh.os, "O_NOFOLLOW", 1, raising=False)
+    monkeypatch.delattr(a2v_refresh.os, "O_NONBLOCK", raising=False)
+    monkeypatch.setattr(
+        a2v_refresh.os,
+        "supports_dir_fd",
+        frozenset(
+            {
+                a2v_refresh.os.open,
+                a2v_refresh.os.unlink,
+                a2v_refresh.os.rmdir,
+            }
+        ),
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="fd-relative staging cleanup is unavailable"):
+        a2v_refresh._require_posix_fd_cleanup_support()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires non-Windows fd-relative cleanup")
+def test_refresh_non_windows_no_replace_failure_cleans_tracked_staging(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    publication_attempted = False
+
+    def unavailable_move(staging: Path, target: Path) -> bool:
+        nonlocal publication_attempted
+        publication_attempted = True
+        return False
+
+    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", unavailable_move)
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**kwargs)
+
+    assert publication_attempted
+    assert not any(
+        path.name.startswith(".a2v-refresh-")
+        for path in _target_run_dir(kwargs).parent.iterdir()
+    )
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "mkfifo"),
+    reason="requires non-Windows FIFO cleanup semantics",
+)
+def test_refresh_non_windows_cleanup_rejects_a_fifo_swap_without_blocking(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    external = ready_source_run.private_root.parent / "fifo-swap-external"
+    external.mkdir()
+    protected = external / "protected.txt"
+    protected.write_bytes(b"external content must survive cleanup")
+    original_walk = a2v_refresh._snapshot_staging_cleanup_tree
+    armed = False
+    swapped = False
+
+    def unavailable_move(staging: Path, target: Path) -> bool:
+        nonlocal armed
+        armed = True
+        return False
+
+    def swap_file_for_fifo(
+        root: Path,
+    ) -> tuple[list[Path], list[Path], list[Any]]:
+        nonlocal swapped
+        files, directories, records = original_walk(root)
+        if armed and not swapped:
+            candidate = Path(root) / "candidates" / ready_source_run.candidate_paths[0].name
+            candidate.rename(candidate.with_name("quarantined-candidate.bin"))
+            os.mkfifo(candidate, 0o600)
+            swapped = True
+        return files, directories, records
+
+    monkeypatch.setattr(a2v_refresh, "_move_directory_no_replace", unavailable_move)
+    monkeypatch.setattr(a2v_refresh, "_snapshot_staging_cleanup_tree", swap_file_for_fifo)
+
+    with pytest.raises(ValueError):
+        refresh_sealed_a2v_run(**_refresh_kwargs(ready_source_run, fresh_controls))
+
+    assert swapped
+    assert protected.read_bytes() == b"external content must survive cleanup"
 
 
 def test_refresh_rechecks_staged_control_expiry_before_publication(
