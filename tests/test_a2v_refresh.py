@@ -581,6 +581,98 @@ def test_refresh_refuses_an_interactive_runs_parent_before_staging(
     assert not any(path.name.startswith(".a2v-refresh-") for path in runs.iterdir())
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows DACL semantics")
+def test_refresh_rejects_interactive_fresh_control_leaf_before_copy(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source control leaf never reaches copying with INTERACTIVE read access."""
+
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    granted = subprocess.run(
+        ["icacls", str(fresh_controls.price_path), "/grant", "*S-1-5-4:(RX)"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert granted.returncode == 0, granted.stdout + granted.stderr
+    before = subprocess.run(
+        ["icacls", str(fresh_controls.price_path)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert before.returncode == 0, before.stdout + before.stderr
+    copied = False
+    original_copy = a2v_refresh._copy_sealed_file
+
+    def record_copy(*args: Any, **kwargs: Any) -> Any:
+        nonlocal copied
+        copied = True
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(a2v_refresh, "_copy_sealed_file", record_copy)
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
+
+    with pytest.raises(ValueError, match="not private"):
+        refresh_sealed_a2v_run(**kwargs)
+
+    after = subprocess.run(
+        ["icacls", str(fresh_controls.price_path)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert after.returncode == 0, after.stdout + after.stderr
+    assert after.stdout == before.stdout
+    assert not copied
+    assert not any(
+        path.name.startswith(".a2v-refresh-")
+        for path in _target_run_dir(kwargs).parent.iterdir()
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows DACL semantics")
+def test_capture_fresh_control_rejects_inherited_interactive_leaf_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The leaf check sees inherited ACEs before fresh controls are copied."""
+
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    private_root = tmp_path / "private"
+    inherited_parent = private_root / "controls"
+    inherited_parent.mkdir(parents=True)
+    granted = subprocess.run(
+        ["icacls", str(inherited_parent), "/grant", "*S-1-5-4:(OI)(CI)(RX)"],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert granted.returncode == 0, granted.stdout + granted.stderr
+    leaf = inherited_parent / "price-evidence.json"
+    leaf.write_text("{}", encoding="utf-8")
+    before = subprocess.run(
+        ["icacls", str(leaf)], capture_output=True, check=False, text=True
+    )
+    assert before.returncode == 0, before.stdout + before.stderr
+    assert "(I)" in before.stdout
+    assert "INTERACTIVE" in before.stdout or "S-1-5-4" in before.stdout
+    monkeypatch.setattr(a2v_refresh._preflight, "_WINDOWS_DACL_CHECK", lambda _path: None)
+
+    with pytest.raises(ValueError, match="not private"):
+        a2v_refresh._capture_fresh_control(private_root, leaf)
+
+    after = subprocess.run(
+        ["icacls", str(leaf)], capture_output=True, check=False, text=True
+    )
+    assert after.returncode == 0, after.stdout + after.stderr
+    assert after.stdout == before.stdout
+
+
 def _refresh_kwargs(ready_source_run: ReadySourceRun, fresh_controls: FreshControls) -> dict[str, Any]:
     return {
         "private_root": ready_source_run.private_root,
@@ -1074,6 +1166,71 @@ def test_refresh_refuses_before_staging_when_windows_runtime_is_unavailable(
         refresh_sealed_a2v_run(**kwargs)
 
     assert not created_staging
+    assert not any(
+        path.name.startswith(".a2v-refresh-")
+        for path in _target_run_dir(kwargs).parent.iterdir()
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows runtime primitives")
+@pytest.mark.parametrize(
+    ("library_name", "primitive"),
+    [
+        ("Kernel32.dll", "SetFileInformationByHandle"),
+        ("Advapi32.dll", "GetEffectiveRightsFromAclW"),
+    ],
+)
+def test_refresh_refuses_before_staging_when_required_windows_primitive_is_missing(
+    ready_source_run: ReadySourceRun,
+    fresh_controls: FreshControls,
+    monkeypatch: pytest.MonkeyPatch,
+    library_name: str,
+    primitive: str,
+) -> None:
+    import ltx_lora_pilot.a2v_refresh as a2v_refresh
+
+    created_staging = False
+    source_verified = False
+    original_mkdtemp = a2v_refresh.tempfile.mkdtemp
+    original_windll = a2v_refresh.ctypes.WinDLL
+    original_verify = a2v_refresh.verify_source_run_static
+
+    class MissingPrimitiveLibrary:
+        def __init__(self, library: Any) -> None:
+            self._library = library
+
+        def __getattr__(self, name: str) -> Any:
+            if name == primitive:
+                raise AttributeError(name)
+            return getattr(self._library, name)
+
+    def missing_primitive(name: str, *args: Any, **kwargs: Any) -> Any:
+        library = original_windll(name, *args, **kwargs)
+        if str(name).casefold() == library_name.casefold():
+            return MissingPrimitiveLibrary(library)
+        return library
+
+    def record_source_verification(**kwargs: Any) -> Any:
+        nonlocal source_verified
+        source_verified = True
+        return original_verify(**kwargs)
+
+    def record_mkdtemp(*args: Any, **kwargs: Any) -> str:
+        nonlocal created_staging
+        if kwargs.get("prefix") == a2v_refresh._STAGING_PREFIX:
+            created_staging = True
+        return original_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(a2v_refresh.ctypes, "WinDLL", missing_primitive)
+    monkeypatch.setattr(a2v_refresh.tempfile, "mkdtemp", record_mkdtemp)
+    monkeypatch.setattr(a2v_refresh, "verify_source_run_static", record_source_verification)
+    kwargs = _refresh_kwargs(ready_source_run, fresh_controls)
+
+    with pytest.raises(ValueError, match="Windows"):
+        refresh_sealed_a2v_run(**kwargs)
+
+    assert not created_staging
+    assert not source_verified
     assert not any(
         path.name.startswith(".a2v-refresh-")
         for path in _target_run_dir(kwargs).parent.iterdir()

@@ -599,6 +599,13 @@ def _windows_dacl_api() -> dict[str, Any]:
         get_length_sid = advapi32.GetLengthSid
         get_length_sid.argtypes = [ctypes.c_void_p]
         get_length_sid.restype = wintypes.DWORD
+        get_effective_rights = advapi32.GetEffectiveRightsFromAclW
+        get_effective_rights.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(_WindowsTrusteeW),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        get_effective_rights.restype = wintypes.DWORD
         set_entries_in_acl = advapi32.SetEntriesInAclW
         set_entries_in_acl.argtypes = [
             wintypes.ULONG,
@@ -628,6 +635,7 @@ def _windows_dacl_api() -> dict[str, Any]:
         "equal_sid": equal_sid,
         "get_ace": get_ace,
         "get_acl_information": get_acl_information,
+        "get_effective_rights": get_effective_rights,
         "get_length_sid": get_length_sid,
         "get_security": get_security,
         "get_security_descriptor_control": get_security_descriptor_control,
@@ -1001,6 +1009,7 @@ def _fresh_control_ancestor_paths(private_root: Path, source: Path) -> tuple[Pat
 
 def _capture_fresh_control(private_root: Path, source: Path) -> _FreshControlSnapshot:
     canonical = require_canonical_private_file(private_root, source)
+    metadata = _require_staging_regular_file(canonical)
     ancestors = tuple(
         (path, _staging_identity(path))
         for path in _fresh_control_ancestor_paths(private_root, canonical)
@@ -1008,7 +1017,7 @@ def _capture_fresh_control(private_root: Path, source: Path) -> _FreshControlSna
     return _FreshControlSnapshot(
         source=canonical,
         ancestors=ancestors,
-        identity=_private_file_identity(canonical),
+        identity=_file_identity_from_metadata(metadata),
     )
 
 
@@ -1024,7 +1033,8 @@ def _verify_fresh_control_snapshot(
         _require_staging_directory(directory)
         if _staging_identity(directory) != expected:
             raise ValueError("private control parent changed")
-    if _private_file_identity(snapshot.source) != snapshot.identity:
+    metadata = _require_staging_regular_file(snapshot.source)
+    if _file_identity_from_metadata(metadata) != snapshot.identity:
         raise ValueError("private control file changed")
 
 
@@ -1871,7 +1881,29 @@ def _remove_staged_prompt_file(path: Path, staging: _TrackedStaging) -> None:
 def _windows_staging_runtime_available() -> bool:
     """Fresh issuer staging relies on Windows handle-bound cleanup and MoveFileExW."""
 
-    return os.name == "nt"
+    if os.name != "nt":
+        return False
+    try:
+        import msvcrt
+
+        if not callable(msvcrt.open_osfhandle) or not callable(msvcrt.get_osfhandle):
+            return False
+        # Resolve and configure every DACL primitive before any source read or
+        # staging creation. This includes LocalFree and the preflight
+        # GetEffectiveRightsFromAclW dependency.
+        _windows_dacl_api()
+        kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
+        for primitive in (
+            "MoveFileExW",
+            "CreateFileW",
+            "SetFileInformationByHandle",
+            "CloseHandle",
+        ):
+            if not callable(getattr(kernel32, primitive)):
+                return False
+    except (AttributeError, ImportError, OSError, ValueError):
+        return False
+    return True
 
 
 def _create_tracked_staging(target: Path) -> _TrackedStaging:
