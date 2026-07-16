@@ -9,6 +9,7 @@ description = "Budget-capped fal LTX character-LoRA pilot tooling"
 requires-python = ">=3.11"
 dependencies = [
   "fal-client>=0.7.0",
+  "httpx>=0.28.0,<0.29.0",
 ]
 
 [project.optional-dependencies]

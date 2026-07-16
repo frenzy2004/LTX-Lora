@@ -1,7 +1,9 @@
 import sys
 from types import SimpleNamespace
 
-from ltx_lora_pilot.fal_api import safe_console_text, submit
+import pytest
+
+from ltx_lora_pilot.fal_api import A2V_ENDPOINT, safe_console_text, submit
 
 
 def test_safe_console_text_escapes_unsupported_unicode() -> None:
@@ -38,3 +40,35 @@ def test_submit_persists_request_id_before_streaming_events(monkeypatch) -> None
 
     assert result == {"ok": True}
     assert order == ["id:request-123", "events", "event:training 😀", "result"]
+
+
+def test_legacy_submit_rejects_the_paid_a2v_endpoint_before_client_import(monkeypatch) -> None:
+    monkeypatch.setenv("FAL_KEY", "test-only")
+    called = []
+    monkeypatch.setitem(
+        sys.modules,
+        "fal_client",
+        SimpleNamespace(submit=lambda *_args, **_kwargs: called.append(True)),
+    )
+
+    with pytest.raises(RuntimeError, match="immutable A2V"):
+        submit(A2V_ENDPOINT, {})
+
+    assert called == []
+
+
+def test_legacy_submit_rejects_all_ltx_trainer_endpoints_before_client_import(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FAL_KEY", "test-only")
+    called = []
+    monkeypatch.setitem(
+        sys.modules,
+        "fal_client",
+        SimpleNamespace(submit=lambda *_args, **_kwargs: called.append(True)),
+    )
+
+    with pytest.raises(RuntimeError, match="immutable A2V"):
+        submit("fal-ai/ltx23-trainer-v2/i2v", {})
+
+    assert called == []
