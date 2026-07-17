@@ -36,7 +36,7 @@ Two substantive limits remain:
 
 The remaining budget is not enough to make a convincing, isolated correction to both the training data and the training architecture. Retrying with fewer steps or arbitrary scale changes would not test a well-supported hypothesis, so no additional paid retraining was submitted.
 
-## Spend record
+## Spend record at the end of this diagnostic stage
 
 This is an internal conservative reservation record, not a provider invoice.
 
@@ -47,7 +47,9 @@ This is an internal conservative reservation record, not a provider invoice.
 | Earlier native-control reservations | 0.3600 |
 | This three-video controlled matrix | 0.3600 |
 | **Accounted total** | **10.2609** |
-| **Remaining inside the original 12.00 cap** | **1.7391** |
+| **Remaining inside the original 12.00 cap at this stage** | **1.7391** |
+
+This was a stage snapshot. Later Full-22B location-coverage controls are accounted separately in [the Full-22B location matrix](A2V_FULL22B_LOCATION_MATRIX.md).
 
 ## Production gate
 
