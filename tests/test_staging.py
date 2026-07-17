@@ -31,6 +31,18 @@ def _stage(fixture: dict[str, object]):
     )
 
 
+def test_stage_session_layout_is_short_and_does_not_repeat_bundle_id(
+    tmp_path: Path,
+) -> None:
+    session, bundle_dir = staging._create_stage_session(tmp_path, "a" * 64)
+    try:
+        assert bundle_dir == session
+        assert session.parent == tmp_path / ".s"
+        assert len(str(session.relative_to(tmp_path))) <= 40
+    finally:
+        staging._remove_stage_session(session)
+
+
 def test_stage_bundle_copies_exact_archive_and_two_bound_validation_pairs(
     ready_run: dict[str, object],
 ) -> None:
@@ -39,7 +51,8 @@ def test_stage_bundle_copies_exact_archive_and_two_bound_validation_pairs(
 
     with _stage(ready_run) as staged:
         session = staged._stage_session
-        assert staged.training_zip.parent.name == staged.bundle_id
+        assert staged.training_zip.parent == session
+        assert session.parent.name == ".s"
         assert staged.training_zip.stat().st_size == source_size
         assert len(staged.validation_pairs) == 2
         assert {pair.group_id for pair in staged.validation_pairs}
@@ -103,5 +116,5 @@ def test_partial_platform_guard_acquisition_closes_prior_handles(
 
     assert len(guards) == 2
     assert all(guard.closed for guard in guards)
-    stage_root = Path(ready_run["private_root"]) / ".a2v-staging"
+    stage_root = Path(ready_run["private_root"]) / ".s"
     assert not list(stage_root.iterdir())

@@ -219,7 +219,8 @@ def test_submit_started_is_durable_before_one_exact_flat_submission(
     assert len(payload["validation"]) == 2
     assert all(set(item) == {"prompt", "image_url", "audio_url"} for item in payload["validation"])
     assert len(uploaded) == 5
-    assert all(path.parent.name == ready_run["bundle_id"] for path in uploaded)
+    assert all(path.parent.name != ready_run["bundle_id"] for path in uploaded)
+    assert all(path.parent.parent.name == ".s" for path in uploaded)
     assert all("candidates" not in path.parts for path in uploaded)
     records = list((Path(ready_run["private_root"]) / ".a2v-provider-state").rglob("*.json"))
     assert records

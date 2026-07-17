@@ -306,16 +306,17 @@ def _freeze_json(value: Any) -> Any:
 
 
 def _create_stage_session(private_root: Path, bundle_id: str) -> tuple[Path, Path]:
-    # Keep the private staging root shallow.  Deep per-run paths exceed the legacy
-    # Windows path limit before the required 64-character content address is added.
-    parent = private_root / ".a2v-staging"
+    # The bundle identity is already sealed in the manifest, request and ledger.
+    # Do not repeat its 64-character digest in every staged path: doing so can
+    # exceed the legacy Windows path limit before a provider request is issued.
+    if not isinstance(bundle_id, str) or len(bundle_id) != 64:
+        raise ValueError("confirmed bundle ID is invalid")
+    parent = private_root / ".s"
     parent.mkdir(parents=True, exist_ok=True)
     os.chmod(parent, 0o700)
     session = parent / uuid.uuid4().hex
     os.mkdir(session, 0o700)
-    bundle_dir = session / bundle_id
-    os.mkdir(bundle_dir, 0o700)
-    return session, bundle_dir
+    return session, session
 
 
 @contextmanager
