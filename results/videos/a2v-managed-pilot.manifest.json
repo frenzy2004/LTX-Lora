@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "scope": "generated native LTX managed A2V pilot outputs only",
+  "training": {
+    "mode": "managed_a2v_lora",
+    "steps": 1000,
+    "status": "completed",
+    "artifact_kept_private": true
+  },
+  "inference": {
+    "model": "fal-ai/ltx-2.3-22b/distilled/audio-to-video/lora",
+    "native_ltx_only": true,
+    "external_lipsync_used": false,
+    "width": 576,
+    "height": 1024,
+    "frames": 89,
+    "fps": 24,
+    "duration_seconds": 3.7083333333333335,
+    "price_estimate_usd_each": "0.074465",
+    "price_basis": "53 billed megapixels at USD 0.001405 per megapixel"
+  },
+  "artifacts": [
+    {
+      "file": "a2v-managed-trainer-preview.mp4",
+      "role": "trainer_preview",
+      "bytes": 4783481,
+      "sha256": "0817d7557e78d728d6dbdb83ee72630abf3a4a149c165891c78863a4bd33fabc",
+      "assessment": "reject_inverted_or_glitched_preview"
+    },
+    {
+      "file": "a2v-managed-pure-lora-control.mp4",
+      "role": "prompt_only_lora_control",
+      "bytes": 2243837,
+      "sha256": "0d99a95b9e6325b54ddf5de5422423a4590079aafa549c61cbd1846b9c1982d6",
+      "seed": 137413,
+      "assessment": "reject_wrong_identity"
+    },
+    {
+      "file": "a2v-managed-reference-anchor-control.mp4",
+      "role": "reference_anchor_control",
+      "bytes": 3102323,
+      "sha256": "4921c3985ddff86c1be922b625aa863e2945ed17aa2eba511c8a95161872fef1",
+      "seed": 137414,
+      "assessment": "reject_not_indistinguishable_and_setting_locked"
+    },
+    {
+      "file": "a2v-managed-location-tradeoff-control.mp4",
+      "role": "reference_strength_location_tradeoff",
+      "bytes": 3135988,
+      "sha256": "14efe78ec912ec296e3ff145837a6daa68a107d614a76ea3eac7afd009240482",
+      "seed": 137415,
+      "assessment": "reject_requested_location_not_achieved"
+    }
+  ]
+}
