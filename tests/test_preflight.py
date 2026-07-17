@@ -1068,6 +1068,35 @@ def test_archive_structural_validation_failure_is_distinct(
     assert _run(ready_run, require_receipt=False).failed_gate == "archive_structural_validation"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-path regression")
+def test_windows_archive_validation_uses_normal_extraction_path(
+    ready_run: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed_paths: list[str] = []
+    original = static_verification.validate_a2v_directory
+
+    def observe_path(path: Path, **kwargs: Any) -> dict[str, Any]:
+        observed_paths.append(str(path))
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(
+        static_verification,
+        "validate_a2v_directory",
+        observe_path,
+    )
+
+    report = _run(ready_run, require_receipt=False)
+
+    assert report.status == "ready_for_policy_issuance"
+    extracted = [
+        path
+        for path in observed_paths
+        if path != str(ready_run["run_dir"] / "candidates")
+    ]
+    assert extracted
+    assert all(not path.startswith("\\\\?\\") for path in extracted)
+
+
 def test_private_root_rejects_dacl_denial_hardlink_ads_and_repository_nesting(
     ready_run: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:

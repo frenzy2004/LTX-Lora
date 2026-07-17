@@ -785,7 +785,7 @@ def _safe_archive_structural_validation(
         if type(train_groups) is not list:
             raise ValueError("dataset training groups are invalid")
         fresh = validate_a2v_directory(
-            _windows_extended_path(temporary),
+            temporary,
             spec=_spec_from_report(artifacts.structural_report, minimum=len(train_groups)),
             trigger_phrase=artifacts.execution_config.get("trigger_phrase"),
         )
