@@ -497,6 +497,28 @@ def test_preflight_reexports_the_shared_static_verifier_without_a_local_copy() -
     }.intersection(functions)
 
 
+def test_preflight_uses_a_shallow_private_archive_parent(
+    ready_run: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed: list[Path | None] = []
+    original = static_verification._verify_static_gates
+
+    def capture_parent(*args: Any, **kwargs: Any) -> Any:
+        observed.append(kwargs.get("archive_temporary_parent"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        static_verification,
+        "_verify_static_gates",
+        capture_parent,
+    )
+
+    assert _run(ready_run, require_receipt=False).status == "ready_for_policy_issuance"
+    assert len(observed) == 1
+    assert observed[0] is not None
+    assert Path(observed[0]).parent == ready_run["private_root"]
+
+
 def test_gate_order_and_public_status_contract_are_exact(ready_run: dict[str, Any]) -> None:
     assert GATE_ORDER == (
         "private_root",
@@ -1095,6 +1117,28 @@ def test_windows_archive_validation_uses_normal_extraction_path(
     ]
     assert extracted
     assert all(not path.startswith("\\\\?\\") for path in extracted)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-path regression")
+def test_windows_archive_validation_writes_members_to_normal_path(
+    ready_run: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = static_verification.validate_a2v_directory
+
+    def inspect_extraction(path: Path, **kwargs: Any) -> dict[str, Any]:
+        candidate_path = ready_run["run_dir"] / "candidates"
+        if Path(path) != candidate_path:
+            expected_members = len(ready_run["train_report"]["groups"]) * 4
+            assert len(list(Path(path).iterdir())) == expected_members
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(
+        static_verification,
+        "validate_a2v_directory",
+        inspect_extraction,
+    )
+
+    assert _run(ready_run, require_receipt=False).status == "ready_for_policy_issuance"
 
 
 def test_private_root_rejects_dacl_denial_hardlink_ads_and_repository_nesting(

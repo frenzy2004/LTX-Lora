@@ -315,14 +315,29 @@ def run_preflight(
     passed.append("private_root")
 
     try:
-        static = _static_verification._verify_static_gates(
-            context,
-            public_bundle_id,
-            require_receipt=require_receipt,
+        archive_temporary_parent, archive_temporary_fingerprint = (
+            _static_verification._create_static_archive_parent(context)
         )
+    except Exception:
+        return finish("archive_structural_validation")
+    try:
+        try:
+            static = _static_verification._verify_static_gates(
+                context,
+                public_bundle_id,
+                require_receipt=require_receipt,
+                archive_temporary_parent=archive_temporary_parent,
+            )
+        finally:
+            _static_verification._remove_static_archive_parent(
+                archive_temporary_parent,
+                archive_temporary_fingerprint,
+            )
     except _static_verification._StaticGateFailure as exc:
         passed.extend(exc.passed_gates)
         return finish(exc.gate)
+    except Exception:
+        return finish("archive_structural_validation")
     artifacts = static.artifacts
     pins = static.pins
     config = static.config
