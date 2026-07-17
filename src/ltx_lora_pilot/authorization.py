@@ -170,6 +170,11 @@ MODEL_ENDPOINT_PATTERN = re.compile(
     r"fal-ai/[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)*",
     re.IGNORECASE | re.ASCII,
 )
+STRUCTURED_BILLING_OBJECT_PATTERN = re.compile(
+    r'(?:\\?")(?:endpointBilling|publicEndpointBilling)(?:\\?")'
+    r"\s*:\s*\{(?P<body>[^{}]{0,1024})\}",
+    re.ASCII,
+)
 HTML_TAG_PATTERN = re.compile(r"<[^<>]*>", re.DOTALL)
 HTML_ATTRIBUTE_VALUE_PATTERN = re.compile(
     r'''=\s*(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)')''',
@@ -341,11 +346,53 @@ def _rate_formula_matches(context: str) -> list[re.Match[str]]:
     ]
 
 
+def _jsonish_field_values(body: str, field: str) -> tuple[str, ...]:
+    normalized = body.replace(r'\"', '"')
+    pattern = re.compile(
+        rf'"{re.escape(field)}"\s*:\s*'
+        r'(?P<value>"[^"\\]*"|[0-9]+\.[0-9]+)',
+        re.ASCII,
+    )
+    values = []
+    for match in pattern.finditer(normalized):
+        value = match.group("value")
+        if value.startswith('"'):
+            value = value[1:-1]
+        values.append(value)
+    return tuple(values)
+
+
+def _structured_a2v_billing_records(
+    text: str,
+) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
+    records: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    for match in STRUCTURED_BILLING_OBJECT_PATTERN.finditer(text):
+        body = match.group("body")
+        endpoints = _jsonish_field_values(body, "endpoint")
+        if A2V_ENDPOINT not in endpoints:
+            continue
+        records.append(
+            (
+                _jsonish_field_values(body, "billing_unit"),
+                _jsonish_field_values(body, "price"),
+            )
+        )
+    return records
+
+
 def _verify_price_statement(content: bytes) -> None:
     try:
         text = html_unescape(content.decode("utf-8", errors="strict"))
     except UnicodeDecodeError as exc:
         raise ValueError("official price response must be UTF-8") from exc
+    structured_records = _structured_a2v_billing_records(text)
+    if structured_records:
+        if any(
+            units != ("steps",) or rates != (A2V_RATE_USD_PER_STEP,)
+            for units, rates in structured_records
+        ):
+            raise ValueError("unexpected A2V rate")
+        return
     contexts = [
         _normalize_price_context(context) for context in _a2v_price_contexts(text)
     ]

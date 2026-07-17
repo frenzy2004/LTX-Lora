@@ -1327,6 +1327,41 @@ def test_price_capture_rejects_conflicting_price_anywhere_on_exact_page() -> Non
         )
 
 
+def test_price_capture_uses_exact_structured_a2v_billing_record() -> None:
+    response = (
+        b'<script>{"endpointBilling":{"endpoint":"fal-ai/other",'
+        b'"billing_unit":"steps","price":0.007},'
+        b'"publicEndpointBilling":{"endpoint":"fal-ai/ltx23-trainer-v2/a2v",'
+        b'"billing_unit":"steps","price":0.006},'
+        b'"endpointBilling":{"endpoint":"fal-ai/ltx23-trainer-v2/a2v",'
+        b'"billing_unit":"steps","price":0.006}}</script>'
+        b'<section data-model="fal-ai/other">0.007 * steps; '
+        b'1000 steps cost $7.00.</section>'
+    )
+
+    evidence = _api().capture_price_evidence(
+        fetch=lambda _url: response,
+        now=FIXED_TIME,
+    )
+
+    assert evidence.rate_usd_per_step == "0.006"
+
+
+def test_price_capture_rejects_conflicting_structured_a2v_billing_records() -> None:
+    response = (
+        b'<script>{"endpointBilling":{"endpoint":"fal-ai/ltx23-trainer-v2/a2v",'
+        b'"billing_unit":"steps","price":0.006},'
+        b'"publicEndpointBilling":{"endpoint":"fal-ai/ltx23-trainer-v2/a2v",'
+        b'"billing_unit":"steps","price":0.007}}</script>'
+    )
+
+    with pytest.raises(ValueError, match="unexpected A2V rate"):
+        _api().capture_price_evidence(
+            fetch=lambda _url: response,
+            now=FIXED_TIME,
+        )
+
+
 def test_price_capture_accepts_identical_live_a2v_duplicates() -> None:
     response = (
         b'<section data-model="fal-ai/ltx23-trainer-v2/a2v">0.006 * steps; '
