@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -16,6 +17,8 @@ import zipfile
 
 import pytest
 
+import ltx_lora_pilot.a2v_static_verification as static_verification
+import ltx_lora_pilot.preflight as preflight_module
 from ltx_lora_pilot.a2v_bundle import (
     FIXED_ARCHIVE_DATETIME,
     FIXED_EXTERNAL_ATTR,
@@ -434,16 +437,17 @@ def _write_ready_run(tmp_path: Path, *, with_receipt: bool = True) -> dict[str, 
 @pytest.fixture
 def ready_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     fixture = _write_ready_run(tmp_path)
-    import ltx_lora_pilot.preflight as preflight
 
-    monkeypatch.setattr(preflight, "_WINDOWS_DACL_CHECK", lambda path: None)
+    monkeypatch.setattr(static_verification, "_WINDOWS_DACL_CHECK", lambda path: None)
 
     def structural_validator(path: Path, **_: Any) -> dict[str, Any]:
         if Path(path) == fixture["run_dir"] / "candidates":
             return fixture["structural"]
         return fixture["train_report"]
 
-    monkeypatch.setattr(preflight, "validate_a2v_directory", structural_validator)
+    monkeypatch.setattr(
+        static_verification, "validate_a2v_directory", structural_validator
+    )
     return fixture
 
 
@@ -459,6 +463,38 @@ def _run(fixture: dict[str, Any], *, require_receipt: bool = True, clock: Callab
         approved_private_root=fixture["private_root"],
         clock=clock,
     )
+
+
+def test_dynamic_preflight_uses_the_shared_static_verifier(
+    ready_run: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        static_verification,
+        "_WINDOWS_DACL_CHECK",
+        lambda _path: (_ for _ in ()).throw(ValueError("static verifier reached")),
+    )
+
+    assert _run(ready_run).failed_gate == "private_root"
+
+
+def test_preflight_reexports_the_shared_static_verifier_without_a_local_copy() -> None:
+    assert preflight_module.StaticA2VBundle is static_verification.StaticA2VBundle
+    assert (
+        preflight_module.verify_static_a2v_bundle
+        is static_verification.verify_static_a2v_bundle
+    )
+
+    source = (ROOT / "src" / "ltx_lora_pilot" / "preflight.py").read_text("utf-8")
+    functions = {
+        node.name
+        for node in ast.parse(source).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert not {
+        "_lexical_context",
+        "_verify_static_gates",
+        "verify_static_a2v_bundle",
+    }.intersection(functions)
 
 
 def test_gate_order_and_public_status_contract_are_exact(ready_run: dict[str, Any]) -> None:
@@ -608,7 +644,7 @@ def test_parsed_control_objects_are_bound_to_their_pinned_bytes(
         if artifact == "root_manifest"
         else ready_run["run_dir"] / "control" / "execution-approval.json"
     )
-    original = preflight._pin_file
+    original = static_verification._pin_file
     changed = False
 
     def swap_before_pin(path: Path):
@@ -623,7 +659,7 @@ def test_parsed_control_objects_are_bound_to_their_pinned_bytes(
             _write_json(path, value)
         return original(path)
 
-    monkeypatch.setattr(preflight, "_pin_file", swap_before_pin)
+    monkeypatch.setattr(static_verification, "_pin_file", swap_before_pin)
     report = _run(ready_run, require_receipt=True)
     assert changed is True
     assert report.failed_gate == "root_artifact_hashes"
@@ -667,7 +703,7 @@ def test_every_parsed_root_artifact_is_bound_to_its_pinned_bytes(
     original_stat = target.stat()
     _secure_tree(ready_run["private_root"])
 
-    original_pin = preflight._pin_file
+    original_pin = static_verification._pin_file
     swapped = False
 
     def swap_before_pin(path: Path):
@@ -681,7 +717,7 @@ def test_every_parsed_root_artifact_is_bound_to_its_pinned_bytes(
             )
         return original_pin(path)
 
-    monkeypatch.setattr(preflight, "_pin_file", swap_before_pin)
+    monkeypatch.setattr(static_verification, "_pin_file", swap_before_pin)
     report = _run(ready_run, require_receipt=False)
     assert swapped is True
     assert report.failed_gate == "root_artifact_hashes"
@@ -903,23 +939,27 @@ def test_semantic_gates_are_attributed_after_rebinding(
     validation = ready_run["run_dir"] / "validation"
 
     def candidate_failure() -> None:
-        original = preflight.validate_a2v_directory
+        original = static_verification.validate_a2v_directory
 
         def fail_candidate(path: Path, **kwargs: Any):
             if Path(path) == ready_run["run_dir"] / "candidates":
                 raise ValueError("candidate structural mismatch")
             return original(path, **kwargs)
 
-        monkeypatch.setattr(preflight, "validate_a2v_directory", fail_candidate)
+        monkeypatch.setattr(
+            static_verification, "validate_a2v_directory", fail_candidate
+        )
 
     cases.append(("candidate_structural_rerun", candidate_failure))
     for expected_gate, mutate in cases:
         mutate()
         assert _run(ready_run, require_receipt=False).failed_gate == expected_gate
 
-    monkeypatch.setattr(preflight, "_WINDOWS_DACL_CHECK", lambda path: None)
     monkeypatch.setattr(
-        preflight,
+        static_verification, "_WINDOWS_DACL_CHECK", lambda path: None
+    )
+    monkeypatch.setattr(
+        static_verification,
         "validate_a2v_directory",
         lambda path, **kwargs: ready_run["structural"]
         if Path(path) == ready_run["run_dir"] / "candidates"
@@ -966,9 +1006,11 @@ def test_late_semantic_gate_attribution(
     fixture = _write_ready_run(tmp_path)
     import ltx_lora_pilot.preflight as preflight
 
-    monkeypatch.setattr(preflight, "_WINDOWS_DACL_CHECK", lambda path: None)
     monkeypatch.setattr(
-        preflight,
+        static_verification, "_WINDOWS_DACL_CHECK", lambda path: None
+    )
+    monkeypatch.setattr(
+        static_verification,
         "validate_a2v_directory",
         lambda path, **kwargs: fixture["structural"] if Path(path) == fixture["run_dir"] / "candidates" else fixture["train_report"],
     )
@@ -1013,14 +1055,16 @@ def test_archive_structural_validation_failure_is_distinct(
 ) -> None:
     import ltx_lora_pilot.preflight as preflight
 
-    original = preflight.validate_a2v_directory
+    original = static_verification.validate_a2v_directory
 
     def fail_extracted(path: Path, **kwargs: Any):
         if Path(path) != ready_run["run_dir"] / "candidates":
             raise ValueError("extracted bytes failed")
         return original(path, **kwargs)
 
-    monkeypatch.setattr(preflight, "validate_a2v_directory", fail_extracted)
+    monkeypatch.setattr(
+        static_verification, "validate_a2v_directory", fail_extracted
+    )
     assert _run(ready_run, require_receipt=False).failed_gate == "archive_structural_validation"
 
 
@@ -1030,12 +1074,14 @@ def test_private_root_rejects_dacl_denial_hardlink_ads_and_repository_nesting(
     import ltx_lora_pilot.preflight as preflight
 
     monkeypatch.setattr(
-        preflight,
+        static_verification,
         "_WINDOWS_DACL_CHECK",
         lambda path: (_ for _ in ()).throw(ValueError("denied")),
     )
     assert _run(ready_run).failed_gate == "private_root"
-    monkeypatch.setattr(preflight, "_WINDOWS_DACL_CHECK", lambda path: None)
+    monkeypatch.setattr(
+        static_verification, "_WINDOWS_DACL_CHECK", lambda path: None
+    )
 
     source = ready_run["run_dir"] / "plan.md"
     alias = ready_run["run_dir"] / "plan-hardlink.md"
@@ -1069,9 +1115,11 @@ def _assert_final_recheck_detects_race(
     fixture = _write_ready_run(tmp_path)
     import ltx_lora_pilot.preflight as preflight
 
-    monkeypatch.setattr(preflight, "_WINDOWS_DACL_CHECK", lambda path: None)
     monkeypatch.setattr(
-        preflight,
+        static_verification, "_WINDOWS_DACL_CHECK", lambda path: None
+    )
+    monkeypatch.setattr(
+        static_verification,
         "validate_a2v_directory",
         lambda path, **kwargs: fixture["structural"] if Path(path) == fixture["run_dir"] / "candidates" else fixture["train_report"],
     )

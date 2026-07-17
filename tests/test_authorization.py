@@ -8,6 +8,7 @@ from importlib import import_module
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 from typing import Any
@@ -63,6 +64,41 @@ def _api() -> Any:
         )
     except (ImportError, AttributeError) as exc:
         pytest.fail(f"authorization API is unavailable: {exc}")
+
+
+def test_authorization_reexports_the_single_pure_contract_implementation() -> None:
+    authorization = import_module("ltx_lora_pilot.authorization")
+    contracts = import_module("ltx_lora_pilot.a2v_contracts")
+
+    for name in (
+        "StandingAuthorization",
+        "PriceEvidence",
+        "validate_execution_config",
+        "STANDING_AUTHORIZATION_FIELDS",
+        "PRICE_EVIDENCE_FIELDS",
+        "EXECUTION_CONFIG_FIELDS",
+    ):
+        assert getattr(authorization, name) is getattr(contracts, name)
+
+
+def test_authorization_import_does_not_eagerly_load_network_transport() -> None:
+    probe = (
+        "import json, sys; "
+        f"sys.path.insert(0, {str(ROOT / 'src')!r}); "
+        "import ltx_lora_pilot.authorization; "
+        "print(json.dumps('urllib.request' in sys.modules))"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-S", "-c", probe],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) is False
 
 
 def matching_snapshot_reader(
@@ -1875,7 +1911,7 @@ def test_default_price_fetch_is_bounded_unauthenticated_and_redirect_limited(
 
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
-    monkeypatch.setattr(_api().urllib_request, "build_opener", build_opener)
+    monkeypatch.setattr(urllib.request, "build_opener", build_opener)
 
     assert _api()._fetch_official_price(OFFICIAL_PRICE_URL) == response_body
     request = opened["request"]
@@ -1895,7 +1931,13 @@ def test_default_price_fetch_is_bounded_unauthenticated_and_redirect_limited(
     assert len(proxy_handlers) == 1
     assert proxy_handlers[0].proxies == {}
 
-    handler = _api()._OfficialPriceRedirectHandler()
+    redirect_handlers = [
+        handler
+        for handler in opened["handlers"]
+        if isinstance(handler, urllib.request.HTTPRedirectHandler)
+    ]
+    assert len(redirect_handlers) == 1
+    handler = redirect_handlers[0]
     with pytest.raises(ValueError, match="redirect left"):
         handler.redirect_request(
             urllib.request.Request(OFFICIAL_PRICE_URL),

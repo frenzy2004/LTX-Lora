@@ -16,7 +16,7 @@ import uuid
 
 from .a2v_bundle import compute_bundle_id
 from .artifacts import FileDigest, canonical_json_bytes, strict_load_json
-from .authorization import validate_execution_config
+from .a2v_contracts import validate_execution_config
 from .private_workspace import require_canonical_run_dir
 
 

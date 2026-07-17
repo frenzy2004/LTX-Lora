@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import ltx_lora_pilot.a2v_static_verification as static_verification
 import ltx_lora_pilot.staging as staging
 from ltx_lora_pilot.staging import StagedArtifactChanged, stage_bundle
 from test_preflight import EXECUTION_ID, PILOT_ID, _write_ready_run
@@ -13,9 +14,10 @@ from test_preflight import EXECUTION_ID, PILOT_ID, _write_ready_run
 @pytest.fixture
 def ready_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     fixture = _write_ready_run(tmp_path)
-    import ltx_lora_pilot.preflight as preflight
 
-    monkeypatch.setattr(preflight, "_WINDOWS_DACL_CHECK", lambda _path: None)
+    monkeypatch.setattr(
+        static_verification, "_WINDOWS_DACL_CHECK", lambda _path: None
+    )
     return fixture
 
 

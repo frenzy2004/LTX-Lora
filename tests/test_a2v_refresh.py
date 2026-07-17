@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
@@ -385,12 +386,12 @@ def _replace_with_link(path: Path) -> None:
 @pytest.fixture
 def ready_source_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ReadySourceRun:
     import ltx_lora_pilot.a2v_dataset as a2v_dataset
-    import ltx_lora_pilot.preflight as preflight
+    import ltx_lora_pilot.a2v_static_verification as static_verification
 
     monkeypatch.setattr(a2v_dataset, "_ffprobe", _media_probe)
     monkeypatch.setattr(a2v_dataset, "_first_frame_sha256", _first_frame_digest)
     monkeypatch.setattr(a2v_dataset, "_reject_digital_silence", lambda path: None)
-    monkeypatch.setattr(preflight, "_WINDOWS_DACL_CHECK", lambda path: None)
+    monkeypatch.setattr(static_verification, "_WINDOWS_DACL_CHECK", lambda path: None)
 
     private_root = tmp_path / "private"
     run_dir = private_root / "pilots" / PILOT_ID / "runs" / EXECUTION_ID
@@ -514,7 +515,9 @@ def test_staging_privacy_rejects_explicit_nonowner_windows_ace(
     assert granted.returncode == 0, granted.stdout + granted.stderr
     # Permit the existing broad check so this test specifically exercises the
     # required owner-SID comparison for the explicit BUILTIN\\Users ACE.
-    monkeypatch.setattr(a2v_refresh._preflight, "_WINDOWS_DACL_CHECK", lambda _path: None)
+    monkeypatch.setattr(
+        a2v_refresh._static_verification, "_WINDOWS_DACL_CHECK", lambda _path: None
+    )
 
     with pytest.raises(ValueError, match="not private"):
         require_private(candidate)
@@ -552,7 +555,9 @@ def test_windows_staging_dacl_rejects_inherited_interactive_ace_and_normalizes(
     assert "(I)" in listed.stdout
     assert "INTERACTIVE" in listed.stdout or "S-1-5-4" in listed.stdout
 
-    monkeypatch.setattr(a2v_refresh._preflight, "_WINDOWS_DACL_CHECK", lambda _path: None)
+    monkeypatch.setattr(
+        a2v_refresh._static_verification, "_WINDOWS_DACL_CHECK", lambda _path: None
+    )
     with pytest.raises(ValueError, match="not private"):
         require_private(candidate)
 
@@ -666,7 +671,9 @@ def test_capture_fresh_control_rejects_inherited_interactive_leaf_without_mutati
     assert before.returncode == 0, before.stdout + before.stderr
     assert "(I)" in before.stdout
     assert "INTERACTIVE" in before.stdout or "S-1-5-4" in before.stdout
-    monkeypatch.setattr(a2v_refresh._preflight, "_WINDOWS_DACL_CHECK", lambda _path: None)
+    monkeypatch.setattr(
+        a2v_refresh._static_verification, "_WINDOWS_DACL_CHECK", lambda _path: None
+    )
 
     with pytest.raises(ValueError, match="not private"):
         a2v_refresh._capture_fresh_control(private_root, leaf)
@@ -740,7 +747,7 @@ from pathlib import Path
 import socket
 import urllib.request
 
-from ltx_lora_pilot import a2v_dataset, authorization, pilot_ledger, preflight
+from ltx_lora_pilot import a2v_dataset, a2v_static_verification, authorization, pilot_ledger
 
 
 def _forbidden(*args, **kwargs):
@@ -778,7 +785,7 @@ def _first_frame_digest(path, **_):
 a2v_dataset._ffprobe = _media_probe
 a2v_dataset._first_frame_sha256 = _first_frame_digest
 a2v_dataset._reject_digital_silence = lambda path: None
-preflight._WINDOWS_DACL_CHECK = lambda path: None
+a2v_static_verification._WINDOWS_DACL_CHECK = lambda path: None
 socket.socket = _forbidden
 socket.create_connection = _forbidden
 urllib.request.urlopen = _forbidden
@@ -1959,6 +1966,62 @@ def test_refresh_issuer_module_is_offline_only() -> None:
             encoding="utf-8"
         )
     )
+
+
+def test_refresh_cli_import_closure_excludes_network_and_authority_modules() -> None:
+    source_root = REPOSITORY_ROOT / "src"
+    probe = (
+        "import json, runpy, sys; "
+        f"sys.path.insert(0, {str(source_root)!r}); "
+        f"runpy.run_path({str(REFRESH_SCRIPT)!r}, run_name='offline_import_probe'); "
+        # pathlib imports urllib.parse in CPython; it is a parser, not the
+        # network-capable urllib.request authority path this CLI forbids.
+        "forbidden = ('urllib.request', 'socket', 'ltx_lora_pilot.authorization', "
+        "'ltx_lora_pilot.pilot_ledger', 'ltx_lora_pilot.preflight', "
+        "'ltx_lora_pilot.a2v_execution', 'ltx_lora_pilot.fal_api'); "
+        "loaded = sorted(name for name in sys.modules if any("
+        "name == item or name.startswith(item + '.') for item in forbidden)); "
+        "print(json.dumps(loaded))"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-S", "-c", probe],
+        capture_output=True,
+        cwd=REPOSITORY_ROOT,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stderr == ""
+    assert json.loads(completed.stdout) == []
+
+
+def test_refresh_cli_declares_exactly_the_ten_safe_operational_options() -> None:
+    tree = ast.parse(REFRESH_SCRIPT.read_text(encoding="utf-8"))
+    declared = {
+        argument.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        for argument in node.args
+        if isinstance(argument, ast.Constant)
+        and isinstance(argument.value, str)
+        and argument.value.startswith("--")
+    }
+
+    assert declared == {
+        "--pilot-id",
+        "--source-execution-id",
+        "--expected-source-bundle-id",
+        "--target-execution-id",
+        "--created-at-utc",
+        "--expires-at-utc",
+        "--price-evidence",
+        "--standing-authorization",
+        "--validation-prompts",
+        "--repository-commit",
+    }
 
 
 def test_refresh_does_not_call_network_receipt_or_ledger_paths(

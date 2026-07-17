@@ -9,7 +9,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Mapping
 
-from .authorization import validate_execution_config
+from .a2v_contracts import validate_execution_config
 from .artifacts import canonical_json_bytes, safe_relative_name, sha256_file
 
 

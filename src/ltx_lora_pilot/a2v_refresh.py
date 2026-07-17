@@ -22,9 +22,9 @@ from .a2v_bundle import (
 from .a2v_dataset import A2VSpec, validate_a2v_directory
 from .a2v_quality import validate_quality_and_splits
 from .artifacts import canonical_json_bytes, sha256_file, strict_load_json
-from .authorization import PriceEvidence, StandingAuthorization, validate_execution_config
-from . import preflight as _preflight
-from .preflight import verify_static_a2v_bundle
+from .a2v_contracts import PriceEvidence, StandingAuthorization, validate_execution_config
+from . import a2v_static_verification as _static_verification
+from .a2v_static_verification import verify_static_a2v_bundle
 from .private_workspace import (
     canonical_new_run_dir,
     require_canonical_private_file,
@@ -916,7 +916,7 @@ def _require_staging_directory_metadata(path: Path) -> Path:
 def _require_staging_directory(path: Path) -> None:
     candidate = _require_staging_directory_metadata(path)
     try:
-        _preflight._WINDOWS_DACL_CHECK(candidate)
+        _static_verification._WINDOWS_DACL_CHECK(candidate)
         _require_windows_private_dacl(candidate)
     except Exception:
         raise ValueError("staging directory is not private") from None
@@ -942,7 +942,7 @@ def _require_staging_regular_file_metadata(path: Path) -> tuple[Path, os.stat_re
 def _require_staging_regular_file(path: Path) -> os.stat_result:
     candidate, metadata = _require_staging_regular_file_metadata(path)
     try:
-        _preflight._WINDOWS_DACL_CHECK(candidate)
+        _static_verification._WINDOWS_DACL_CHECK(candidate)
         _require_windows_private_dacl(candidate)
     except Exception:
         raise ValueError("staging file is not private") from None

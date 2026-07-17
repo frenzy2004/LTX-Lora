@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
+import ltx_lora_pilot.a2v_static_verification as static_verification
 import ltx_lora_pilot.a2v_execution as execution
 from ltx_lora_pilot.a2v_execution import (
     AmbiguousProviderSubmission,
@@ -24,16 +25,19 @@ from test_preflight import EXECUTION_ID, _clock, _typed_id, _write_ready_run
 @pytest.fixture
 def ready_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     fixture = _write_ready_run(tmp_path)
-    import ltx_lora_pilot.preflight as preflight
 
-    monkeypatch.setattr(preflight, "_WINDOWS_DACL_CHECK", lambda _path: None)
+    monkeypatch.setattr(
+        static_verification, "_WINDOWS_DACL_CHECK", lambda _path: None
+    )
 
     def structural_validator(path: Path, **_: Any) -> dict[str, Any]:
         if Path(path) == fixture["run_dir"] / "candidates":
             return fixture["structural"]
         return fixture["train_report"]
 
-    monkeypatch.setattr(preflight, "validate_a2v_directory", structural_validator)
+    monkeypatch.setattr(
+        static_verification, "validate_a2v_directory", structural_validator
+    )
     return fixture
 
 
