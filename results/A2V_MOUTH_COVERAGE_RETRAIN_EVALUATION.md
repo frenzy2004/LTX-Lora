@@ -31,6 +31,18 @@ All three files are generated LTX output and are safe to review in the repositor
 
 Checksums and technical metadata are in [the public manifest](videos/a2v-mouth-retrain-evaluation.manifest.json).
 
+## Existing multi-location evidence
+
+The repository also contains a separate, earlier Full-22B LTX A2V location matrix. It uses a different evaluation run, not the retrained adapter above, and provides three additional held-out speaking-location candidates:
+
+| Held-out location | Generated video |
+|---|---|
+| Location 1 | [MP4](videos/a2v-full22b-lora-location-1.mp4) |
+| Location 2 | [MP4](videos/a2v-full22b-lora-location-2.mp4) |
+| Location 3 | [MP4](videos/a2v-full22b-lora-location-3.mp4) |
+
+See [the location-matrix report](A2V_FULL22B_LOCATION_MATRIX.md) for its fixed configuration, media checks, and limitations. These clips expand the evidence across three held-out locations, but they do not replace a blinded real-versus-generated review and do not make an indistinguishability claim.
+
 ## Evidence-based assessment
 
 The files open successfully and include an audio stream. Frame-by-frame comparison against the withheld real clip shows that the generated candidates retain the same subject identity cues, garment, framing, and scene. They are visibly generated sequences rather than copied source video: at matched timestamps, head pose, gaze, and mouth geometry differ from the withheld footage.
