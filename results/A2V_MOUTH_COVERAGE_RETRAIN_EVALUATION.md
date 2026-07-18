@@ -101,6 +101,8 @@ Consequently, a local full-model retrain is not a viable remediation on this mac
 
 No new provider request was submitted while preparing this failure review.
 
+For the cross-run decision record—what failed, what is only a baseline, and what must change before another paid LTX-only experiment—see [the A2V experiment decision log](A2V_EXPERIMENT_DECISION_LOG.md).
+
 ## Cost ledger
 
 | Ledger component | Amount (USD) |
