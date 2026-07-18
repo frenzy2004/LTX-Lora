@@ -56,7 +56,7 @@ The appropriate acceptance test is a blinded, randomized playback comparison aga
 
 ## Conservative spend snapshot
 
-This is a local spend-control ledger, not a provider invoice. It counts completed requests and one provider result that remains conservatively marked as uncertain.
+This is a local spend-control ledger, not a provider invoice. It counts completed requests and one provider result that remains conservatively marked as uncertain. The figures below are the historical snapshot at the time this location matrix was made.
 
 | Ledger item | USD |
 | --- | ---: |
@@ -68,6 +68,10 @@ This is a local spend-control ledger, not a provider invoice. It counts complete
 | **Remaining inside the original 12.0000 cap** | **1.1791** |
 
 No additional inference is authorized by this report. The three files above should be reviewed before spending the remaining cap.
+
+### Later audit status
+
+This matrix was later included in a complete public-output visual audit. The review did **not** clear any of its clips for an indistinguishable-from-real claim. It also identified that the subsequent mouth-coverage retrain brought the cumulative accounted spend to $13.8209 of the $14.0000 authorized ceiling; therefore the historical remaining figure above is no longer available authority. See [the current evaluation and failure review](A2V_MOUTH_COVERAGE_RETRAIN_EVALUATION.md).
 
 ## Publication boundary
 
