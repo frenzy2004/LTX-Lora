@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "generated_only": true,
+  "training": {
+    "mode": "LTX-2.3 A2V LoRA",
+    "training_groups": 13,
+    "heldout_groups": 5,
+    "rank": 32,
+    "steps": 1000,
+    "learning_rate": 0.00015,
+    "frames": 89,
+    "fps": 24,
+    "aspect_ratio": "9:16",
+    "resolution": "high"
+  },
+  "inference": {
+    "endpoint_class": "LTX-2.3 Quality A2V with LoRA",
+    "lora_scale": 0.8,
+    "inference_steps": 30,
+    "guidance_scale": 1.0,
+    "video_quality": "maximum",
+    "image_strength": 1.0,
+    "prompt_expansion": false
+  },
+  "artifacts": [
+    {
+      "file": "a2v-1000step-quality-heldout-wall.mp4",
+      "sha256": "1f16f2be8b29e9d4b40d04fd73c9f74fc886fdbddd38855f0f95621439c14e0d",
+      "bytes": 844289,
+      "width": 576,
+      "height": 960,
+      "frames": 89,
+      "fps": 24,
+      "duration_seconds": 3.708333,
+      "audio": "AAC mono 48000 Hz",
+      "review_decision": "promising but not approved as indistinguishable"
+    },
+    {
+      "file": "a2v-1000step-quality-heldout-office.mp4",
+      "sha256": "8cd49fcdb56c13c10dd401c5274a1ae8bab6a7ca63a6cf308e50314e3142807a",
+      "bytes": 703325,
+      "width": 576,
+      "height": 960,
+      "frames": 89,
+      "fps": 24,
+      "duration_seconds": 3.708333,
+      "audio": "AAC mono 48000 Hz",
+      "review_decision": "rejected for visible generated artifacts"
+    }
+  ],
+  "provider_delivery": {
+    "retrieved_videos": 2,
+    "completed_compute_without_retrievable_result": 2,
+    "single_flight_collection_required": true
+  },
+  "known_cost_usd": {
+    "two_debug_runs": 1.2,
+    "candidate_training": 6.0,
+    "two_retrieved_quality_inferences": 0.266491,
+    "current_controlled_sequence_subtotal": 7.466491,
+    "historical_plus_current_known_subtotal": 21.287391,
+    "unretrievable_completed_requests": "provider billing unknown"
+  },
+  "privacy": {
+    "raw_training_media_included": false,
+    "raw_holdout_media_included": false,
+    "adapter_included": false,
+    "provider_identifiers_included": false,
+    "provider_urls_included": false,
+    "credentials_included": false
+  }
+}

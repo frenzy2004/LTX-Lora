@@ -16,6 +16,7 @@ No experiment is retried merely because it is cheap or easy to call. A new provi
 | Reference weakening for a new location | [Published control](videos/a2v-managed-location-tradeoff-control.mp4) did not deliver the requested location change. | **Rejected for location transfer.** | The conditioning/training route changes; do not repeat the same reference-strength trade-off. |
 | Full-22B three-location matrix | [Location matrix](A2V_FULL22B_LOCATION_MATRIX.md) contains technically valid candidates but no blinded proof of realism. | **Baseline evidence only; not a quality approval.** | The next comparison adds a genuinely source-isolated hold-out and blinded playback review. |
 | 400-step mouth-coverage retrain | [Current evaluation](A2V_MOUTH_COVERAGE_RETRAIN_EVALUATION.md) did not meet the realism bar. Submitted clips were 544×960, 3.708-second derivatives; the set had 2 training clips tagged for visible inner-mouth speech. | **Rejected for the required standard.** | The dataset, crop/resize policy, caption scheme, and validation design change together and are inspected before training. |
+| 1,000-step provider-decoded quality rebuild | [Current rebuild](A2V_1000_STEP_QUALITY_REBUILD_EVALUATION.md) used a source/location-separated 13/5 split, explicit speech tags, provider-decoded data inspection, and LTX Quality inference. The wall result improved substantially, but the office result invented prominent text and softened motion detail. | **Rejected for indistinguishability; retain as evidence of conditional improvement.** | Visible text/logos are removed from the data, face-dominant framing is strengthened, provider requests run single-flight, and a blinded playback test is retained. |
 | Local full LTX-2 training on this PC | The official local trainer requires Linux/CUDA, local model assets, and typically an 80 GB GPU; this machine had 26.38 GiB free during the audit. | **Not viable on this machine.** | Compute and storage environment change. This is not a Fal quality conclusion. |
 | Non-LTX lip-sync or generation model | Outside the defined LTX-only scope. | **Out of scope.** | The project scope itself changes. |
 
@@ -31,7 +32,7 @@ A future paid run must be a **new Fal-managed LTX A2V LoRA evaluation**, not a r
 
 ## Cost status
 
-The published evidence set accounts for **$13.8209** against the historical **$14.0000** ceiling. This log does not authorize a new provider request. It exists to make the next decision evidence-led rather than repetitive.
+The published evidence set accounted for **$13.8209** before the controlled rebuild. The rebuild adds a known **$7.466491** for two 100-step data checks, one 1,000-step candidate, and two retrieved Quality outputs, producing a known cumulative subtotal of **$21.287391**. Two completed-compute requests had unretrievable results, so any associated provider billing is not included in that subtotal. This log does not authorize another provider request.
 
 ## How to use this log
 
