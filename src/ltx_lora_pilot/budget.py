@@ -6,13 +6,17 @@ import tempfile
 import time
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_UP
 from pathlib import Path
 from typing import Any
 
 
 DEFAULT_CAP_USD = Decimal("12.00")
-TRAINING_RATE_PER_STEP = Decimal("0.0024")
+TRAINING_RATES = {
+    "i2v": Decimal("0.0024"),
+    "a2v": Decimal("0.006"),
+}
+TRAINING_RATE_PER_STEP = TRAINING_RATES["i2v"]
 INFERENCE_RATES = {
     "distilled": Decimal("0.001405"),
     "full": Decimal("0.001805"),
@@ -24,10 +28,12 @@ def money(value: Decimal | str | float | int) -> Decimal:
     return Decimal(str(value)).quantize(Decimal("0.0001"), rounding=ROUND_UP)
 
 
-def estimate_training_cost(steps: int) -> Decimal:
+def estimate_training_cost(steps: int, *, mode: str = "i2v") -> Decimal:
     if steps < 100:
         raise ValueError("fal bills at least 100 training steps")
-    return money(TRAINING_RATE_PER_STEP * steps)
+    if mode not in TRAINING_RATES:
+        raise ValueError(f"unknown training mode: {mode}")
+    return money(TRAINING_RATES[mode] * steps)
 
 
 def estimate_inference_cost(tier: str, width: int, height: int, frames: int) -> Decimal:
@@ -39,6 +45,15 @@ def estimate_inference_cost(tier: str, width: int, height: int, frames: int) -> 
     return money(INFERENCE_RATES[tier] * megapixel_frames)
 
 
+def estimate_per_minute_cost(rate_per_minute: Decimal, duration_seconds: Decimal) -> Decimal:
+    rate_per_minute = Decimal(rate_per_minute)
+    duration_seconds = Decimal(duration_seconds)
+    if rate_per_minute <= 0 or duration_seconds <= 0:
+        raise ValueError("rate and duration must be positive")
+    billable_seconds = duration_seconds.to_integral_value(rounding=ROUND_CEILING)
+    return money(rate_per_minute * billable_seconds / Decimal("60"))
+
+
 @dataclass(frozen=True)
 class Reservation:
     id: str
@@ -46,7 +61,7 @@ class Reservation:
 
 
 class BudgetLedger:
-    """Single-process atomic budget ledger for provider requests."""
+    """Legacy single-process JSON ledger retained for historical callers."""
 
     def __init__(self, path: Path, cap_usd: Decimal = DEFAULT_CAP_USD) -> None:
         self.path = path

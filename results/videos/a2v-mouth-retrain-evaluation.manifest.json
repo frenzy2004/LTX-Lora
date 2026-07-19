@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "artifact_type": "generated_ltx_a2v_evaluation",
+  "run_date": "2026-07-18",
+  "scope": {
+    "training_groups": 14,
+    "holdout_groups": 3,
+    "training_mode": "LTX A2V LoRA",
+    "training_steps": 400,
+    "evaluation_model": "LTX-2.3 Full 22B A2V LoRA",
+    "evaluation_condition": "single held-out speaking clip; identical audio/start-image conditioning across candidates"
+  },
+  "privacy": {
+    "generated_videos_only": true,
+    "raw_source_media_included": false,
+    "adapter_weights_included": false,
+    "provider_urls_included": false,
+    "provider_request_ids_included": false,
+    "credentials_included": false,
+    "participant_identifiers_included": false
+  },
+  "artifacts": [
+    {
+      "variant": "a2v_plus_i2v_025",
+      "filename": "a2v-mouth-retrain-new-a2v-i2v-025.mp4",
+      "sha256": "6bbd0188dd6e57857673a93475aafb3643835ff039c6c35df3635d75291151c4",
+      "bytes": 1390509,
+      "duration_seconds": 3.708,
+      "video": {
+        "codec": "h264",
+        "width": 576,
+        "height": 960,
+        "fps": 24
+      },
+      "audio": {
+        "codec": "aac",
+        "sample_rate_hz": 48000,
+        "channels": 1
+      }
+    },
+    {
+      "variant": "a2v_plus_i2v_050",
+      "filename": "a2v-mouth-retrain-new-a2v-i2v-050.mp4",
+      "sha256": "628822609b9d7f61097967cae44b960c4f0febc33c0186ac9498a045c3c9dbf2",
+      "bytes": 1372225,
+      "duration_seconds": 3.708,
+      "video": {
+        "codec": "h264",
+        "width": 576,
+        "height": 960,
+        "fps": 24
+      },
+      "audio": {
+        "codec": "aac",
+        "sample_rate_hz": 48000,
+        "channels": 1
+      }
+    },
+    {
+      "variant": "a2v_only",
+      "filename": "a2v-mouth-retrain-new-a2v-only.mp4",
+      "sha256": "b28e61104e0a6b253a69ded93b82598a29a9c7f81debcdc49ccbba9402a63ce0",
+      "bytes": 1393897,
+      "duration_seconds": 3.708,
+      "video": {
+        "codec": "h264",
+        "width": 576,
+        "height": 960,
+        "fps": 24
+      },
+      "audio": {
+        "codec": "aac",
+        "sample_rate_hz": 48000,
+        "channels": 1
+      }
+    }
+  ]
+}

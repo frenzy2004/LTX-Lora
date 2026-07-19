@@ -48,6 +48,18 @@
         "consent_or_authorization": "confirmed",
         "embedded_source_asset_metadata": false
       }
+    },
+    {
+      "filename": "ltx23-ic-lora-whatsapp-audio-11s.mp4",
+      "sha256": "1f6ae6f1f030b08a5c2a75749103a2d84f69983f0d5d74caf911cffb588c37cc",
+      "bytes": 2567108,
+      "quality_status": "candidate_qa_pass_pending_user_acceptance",
+      "approval_date": "2026-07-19",
+      "manual_review": {
+        "output_classification": "generated_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
     }
   ]
 }

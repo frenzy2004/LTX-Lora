@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-07-19",
+  "generation_policy": {
+    "ltx_only": true,
+    "external_lip_sync": false,
+    "non_ltx_generative_provider": false,
+    "maximum_paid_requests_in_flight": 1,
+    "incremental_provider_cap_usd": 60.0
+  },
+  "source_audio": {
+    "original_container_sha256": "BAA394CD1F3C622E0475482BA443F0EA5C4102FFD081004CA1F156B6C6A96E87",
+    "normalized_pcm_sha256": "214D753D646147E65E70EC469E9769AD0F387535D352041F9C51913A116E6B6F",
+    "decoded_duration_seconds": 10.857333,
+    "normalization": "FFmpeg decode to PCM s16le, 48 kHz, stereo; AAC priming delay removed"
+  },
+  "adapter": {
+    "type": "participant_ic_lora",
+    "trainer_endpoint": "fal-ai/ltx23-trainer-v2/v2v",
+    "steps": 3000,
+    "training_pair_count": 50,
+    "weights_sha256": "F2D1ECA8516E15942247C0136C006E538AE0016ACAE689738799315C0161A45D",
+    "weights_bytes": 327287352,
+    "weights_included": false,
+    "one_time_main_training_cost_usd": 17.7
+  },
+  "motion_driver": {
+    "endpoint": "fal-ai/ltx-2.3/audio-to-video",
+    "frames": 265,
+    "fps": 24,
+    "aspect_ratio": "9:16",
+    "rgb_reference_sha256": "AA1A2DCCE6CC1B23FF7B2F83C99B20F7582766D00F92CE6AAB1937B3F9E4FBEF",
+    "cost_usd": 1.1
+  },
+  "identity_transform": {
+    "endpoint": "fal-ai/ltx-2.3-quality/reference-video-to-video/lora",
+    "seed": 24071945,
+    "lora_scale": 0.6,
+    "num_frames": 265,
+    "fps": 24,
+    "preserve_original_video": false,
+    "strength": 1.0,
+    "video_strength": 1.0,
+    "real_first_frame_anchor": true,
+    "silent_output_sha256": "73839A0B894140FBD680AC117908E266B5D7F20E60B5FE7832FF961F7F420B48",
+    "cost_usd": 0.38
+  },
+  "selected_inference_cost_usd": 1.48,
+  "pilot_accounted_or_reserved_usd_at_packaging": 27.18,
+  "final_output": {
+    "file": "ltx_ic_lora_whatsapp_audio_11s.mp4",
+    "sha256": "1F6AE6F1F030B08A5C2A75749103A2D84F69983F0D5D74CAF911CFFB588C37CC"
+  },
+  "private_material_excluded": [
+    "credentials",
+    "provider_request_ids",
+    "signed_provider_urls",
+    "transcript_text",
+    "raw_source_media",
+    "adapter_weights"
+  ]
+}

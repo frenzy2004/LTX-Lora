@@ -54,6 +54,13 @@ APPROVED_PUBLIC_VIDEOS = {
         "approval_date": "2026-07-15",
         "output_classification": "edited_real_footage_output",
     },
+    "ltx23-ic-lora-whatsapp-audio-11s.mp4": {
+        "bytes": 2_567_108,
+        "sha256": "1f6ae6f1f030b08a5c2a75749103a2d84f69983f0d5d74caf911cffb588c37cc",
+        "quality_status": "candidate_qa_pass_pending_user_acceptance",
+        "approval_date": "2026-07-19",
+        "output_classification": "generated_output",
+    },
 }
 
 

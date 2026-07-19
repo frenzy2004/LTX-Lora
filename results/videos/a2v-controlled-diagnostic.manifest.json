@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "test": "same-held-out-input A2V base-versus-LoRA-scale diagnostic",
+  "output_spec": {
+    "width": 544,
+    "height": 960,
+    "frames": 89,
+    "fps": 24,
+    "seed": 7172026
+  },
+  "controls": [
+    {
+      "file": "a2v-controlled-base-holdout.mp4",
+      "mode": "base-a2v",
+      "lora_scale": null,
+      "bytes": 3532826,
+      "sha256": "f83367e2f39391e57d6a96684b8104412b60e6641d55c7949474b2c84719c02a"
+    },
+    {
+      "file": "a2v-controlled-lora-scale-050-holdout.mp4",
+      "mode": "a2v-lora",
+      "lora_scale": 0.5,
+      "bytes": 3506599,
+      "sha256": "8f7b743888c80f66a853a3fe9becc804127523cc05fe89a7583201958a8254d7"
+    },
+    {
+      "file": "a2v-controlled-lora-scale-080-holdout.mp4",
+      "mode": "a2v-lora",
+      "lora_scale": 0.8,
+      "bytes": 3521249,
+      "sha256": "92821ec15c28780f356668e5d9be8d91fa7b0340c1e53fa1d5123afcebc9075d"
+    }
+  ],
+  "privacy": {
+    "raw_media_included": false,
+    "audio_included": false,
+    "adapter_weights_included": false,
+    "provider_urls_included": false,
+    "request_ids_included": false
+  }
+}

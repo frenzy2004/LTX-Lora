@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "artifact": "ltx-full22b-a2v-lora-held-out-location-matrix",
+  "generated_media_only": true,
+  "raw_source_media_included": false,
+  "reference_images_included": false,
+  "source_audio_included": false,
+  "adapter_weights_included": false,
+  "hosted_asset_urls_included": false,
+  "provider_request_identifiers_included": false,
+  "credential_material_included": false,
+  "fixed_output_specification": {
+    "width": 576,
+    "height": 960,
+    "frames": 89,
+    "frames_per_second": 24,
+    "duration_seconds": 3.708,
+    "video_codec": "h264",
+    "audio_codec": "aac"
+  },
+  "inference_configuration": {
+    "model_path": "LTX 2.3 Full 22B Audio-to-Video LoRA",
+    "adapter_scale": 0.5,
+    "inference_steps": 40,
+    "quality": "maximum",
+    "camera": "static",
+    "multiscale": true,
+    "image_strength": 1.0,
+    "audio_strength": 1.0,
+    "prompt_expansion": false,
+    "seed_fixed_across_matrix": true
+  },
+  "outputs": [
+    {
+      "location_alias": "location-1",
+      "file": "a2v-full22b-lora-location-1.mp4",
+      "bytes": 1456561,
+      "sha256": "7055c3400af0cb90a6b95b1a79f5336089d1a49510f50463748456daeda72775"
+    },
+    {
+      "location_alias": "location-2",
+      "file": "a2v-full22b-lora-location-2.mp4",
+      "bytes": 4422367,
+      "sha256": "3476fdd77db2173e6e960407af1a5fe4bcecb05449e1166499048f57585be125"
+    },
+    {
+      "location_alias": "location-3",
+      "file": "a2v-full22b-lora-location-3.mp4",
+      "bytes": 1299018,
+      "sha256": "c112f5b8b5b54e6dd82d86094ed5012c984bf8039617a523d345a44a16387a14"
+    }
+  ],
+  "acceptance_status": "candidate_for_blind_playback_review_not_production_approved",
+  "ledger_snapshot": {
+    "original_cap_usd": "12.0000",
+    "accounted_or_reserved_usd": "10.8209",
+    "remaining_original_cap_usd": "1.1791"
+  }
+}
