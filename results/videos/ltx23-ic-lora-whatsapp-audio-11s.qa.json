@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-07-19",
+  "selected_candidate": "anchored_ic_lora_scale_0_6",
+  "final_media": {
+    "file": "ltx_ic_lora_whatsapp_audio_11s.mp4",
+    "sha256": "1F6AE6F1F030B08A5C2A75749103A2D84F69983F0D5D74CAF911CFFB588C37CC",
+    "bytes": 2567108,
+    "container_duration_seconds": 10.958008,
+    "video": {
+      "codec": "h264",
+      "width": 576,
+      "height": 960,
+      "fps": 24,
+      "frames": 263,
+      "start_time_seconds": 0.0,
+      "duration_seconds": 10.958008
+    },
+    "audio": {
+      "codec": "aac",
+      "sample_rate_hz": 48000,
+      "channels": 2,
+      "start_time_seconds": 0.0,
+      "duration_seconds": 10.857,
+      "mean_volume_db": -33.7,
+      "max_volume_db": -11.5
+    }
+  },
+  "audio_integrity": {
+    "whisper_model": "Systran/faster-whisper-small.en (local cache)",
+    "source_word_count": 29,
+    "output_word_count": 29,
+    "normalized_transcript_exact_match": true,
+    "aligned_pcm_correlation": 0.999751,
+    "best_alignment_lag_samples_at_16khz": 0,
+    "best_alignment_lag_ms": 0.0,
+    "transcript_content_redacted": true
+  },
+  "mechanical_checks": {
+    "full_video_audio_decode": "pass",
+    "black_events_at_0_10_second_threshold": 0,
+    "freeze_events_at_0_50_second_threshold": 0
+  },
+  "visual_review": {
+    "full_duration_sample_rate_fps": 4,
+    "sampled_identity_continuity": "pass",
+    "continuous_mouth_articulation": "pass",
+    "obvious_face_collapse_or_warp": "not_observed",
+    "background_or_clothing_leakage": "not_observed_in_selected_candidate",
+    "review_artifacts": [
+      "contact_sheet_2fps.png",
+      "mouth_identity_sweep_4fps.png"
+    ]
+  },
+  "limitations": [
+    "No external lip-sync system was used.",
+    "No independent phoneme-to-viseme scoring model was used; lip-sync quality was reviewed perceptually from the LTX audio-conditioned motion and sampled frame sequence.",
+    "Indistinguishability is a human perceptual judgment and is not guaranteed by the mechanical checks."
+  ]
+}
