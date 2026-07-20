@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import mmap
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -30,6 +31,10 @@ KEY_PATTERN = re.compile(
     r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}:[0-9a-fA-F]{32})"
     r"(?![A-Za-z0-9])"
+)
+KEY_PATTERN_BYTES = re.compile(
+    rb"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    rb"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}:[0-9a-fA-F]{32})"
 )
 LOSS_TEXT_PATTERN = re.compile(
     r"\bloss(?:\s+[a-z_][a-z0-9_]*)?\s*[:=]\s*"
@@ -121,12 +126,34 @@ def atomic_write_json(path: Path, value: object) -> None:
     os.replace(temporary, path)
 
 
-def extract_unique_fal_key(path: Path) -> str:
+def extract_unique_fal_key(
+    path: Path,
+    *,
+    expected_sha256: str | None = None,
+) -> str:
     if not path.is_file():
         raise ProviderExecutionError("credential attachment is unavailable")
-    matches = sorted(
-        set(KEY_PATTERN.findall(path.read_text(encoding="utf-8", errors="strict")))
-    )
+    with path.open("rb") as handle:
+        if os.fstat(handle.fileno()).st_size == 0:
+            matches: list[str] = []
+        else:
+            with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                matches = sorted(
+                    {
+                        value.decode("ascii")
+                        for value in KEY_PATTERN_BYTES.findall(mapped)
+                    }
+                )
+    if expected_sha256 is not None:
+        if SHA256_PATTERN.fullmatch(expected_sha256) is None:
+            raise ProviderExecutionError(
+                "credential SHA-256 must be a full lowercase hexadecimal digest"
+            )
+        matches = [
+            value
+            for value in matches
+            if hashlib.sha256(value.encode("ascii")).hexdigest() == expected_sha256
+        ]
     if len(matches) != 1:
         raise ProviderExecutionError(
             "credential attachment must contain exactly one unique Fal key"
@@ -311,6 +338,7 @@ def start_run(
     steps: int,
     trigger_phrase: str,
     validation: list[dict[str, object]],
+    key_sha256: str | None = None,
     upload_fn: Callable[[Path, str], str] = upload_file,
     submit_fn: Callable[[str, dict[str, Any], str], dict[str, str]] | None = None,
     now: datetime | None = None,
@@ -345,9 +373,11 @@ def start_run(
         "phase": "reserved",
         "created_at_utc": utc_now(now),
     }
+    if key_sha256 is not None:
+        state["credential_sha256"] = key_sha256
     atomic_write_json(state_path, state)
 
-    key = extract_unique_fal_key(key_source)
+    key = extract_unique_fal_key(key_source, expected_sha256=key_sha256)
     try:
         training_url = upload_fn(archive, key)
         if not _secure_url(training_url):
@@ -705,6 +735,7 @@ def monitor_run(
     state_dir: Path,
     budget_path: Path,
     key_source: Path,
+    key_sha256: str | None = None,
     status_fn: Callable[[str, str], object] = provider_status,
     result_fn: Callable[[str, str], dict[str, Any]] = provider_result,
     download_fn: Callable[[dict[str, Any], Path], list[str]] = download_result_artifacts,
@@ -731,7 +762,7 @@ def monitor_run(
         raise ProviderExecutionError("execution has no submitted provider request")
     if state.get("application") != A2V_APPLICATION:
         raise ProviderExecutionError("execution endpoint mismatch")
-    key = extract_unique_fal_key(key_source)
+    key = extract_unique_fal_key(key_source, expected_sha256=key_sha256)
     raw_status = status_fn(key, request_id)
     status_type = type(raw_status).__name__.lower()
     snapshot = _jsonable(raw_status)
@@ -909,6 +940,7 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--archive", type=Path, required=True)
     start.add_argument("--budget", type=Path, required=True)
     start.add_argument("--key-source", type=Path, required=True)
+    start.add_argument("--key-sha256")
     start.add_argument("--price-evidence", type=Path, required=True)
     start.add_argument("--state-dir", type=Path, required=True)
     start.add_argument("--label", required=True)
@@ -917,6 +949,7 @@ def build_parser() -> argparse.ArgumentParser:
     monitor = commands.add_parser("monitor")
     monitor.add_argument("--budget", type=Path, required=True)
     monitor.add_argument("--key-source", type=Path, required=True)
+    monitor.add_argument("--key-sha256")
     monitor.add_argument("--state-dir", type=Path, required=True)
 
     release = commands.add_parser("release-unsubmitted")
@@ -940,12 +973,14 @@ def main(argv: list[str] | None = None) -> int:
             steps=int(config["steps"]),
             trigger_phrase=str(config["trigger_phrase"]),
             validation=list(config["validation"]),
+            key_sha256=args.key_sha256,
         )
     elif args.command == "monitor":
         output = monitor_run(
             state_dir=args.state_dir,
             budget_path=args.budget,
             key_source=args.key_source,
+            key_sha256=args.key_sha256,
         )
     else:
         output = release_unsubmitted_budget(

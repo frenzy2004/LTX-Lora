@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -12,6 +13,68 @@ import pytest
 
 RUN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(RUN_ROOT / "tools"))
+
+
+def test_credential_reader_streams_without_loading_the_whole_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from run_a2v_broad_provider import extract_unique_fal_key
+
+    fake_key = "00000000-0000-0000-0000-000000000000:" + "1" * 32
+    source = tmp_path / "large-private-source.jsonl"
+    source.write_text(f"first line\nprivate {fake_key}\nlast line\n", encoding="utf-8")
+
+    def forbid_read_text(*args: object, **kwargs: object) -> str:
+        raise AssertionError("credential source must be streamed, not loaded in full")
+
+    monkeypatch.setattr(Path, "read_text", forbid_read_text)
+
+    assert extract_unique_fal_key(source) == fake_key
+
+
+def test_credential_reader_can_scan_a_binary_private_source(tmp_path: Path) -> None:
+    from run_a2v_broad_provider import extract_unique_fal_key
+
+    fake_key = "22222222-2222-2222-2222-222222222222:" + "3" * 32
+    source = tmp_path / "private-log.sqlite"
+    source.write_bytes(b"\xff\xfe\x00binary-prefix\x00" + fake_key.encode("ascii") + b"\x00tail")
+
+    try:
+        result = extract_unique_fal_key(source)
+    except UnicodeDecodeError:
+        pytest.fail("credential reader must scan binary private sources safely")
+
+    assert result == fake_key
+
+
+def test_binary_credential_reader_tolerates_database_record_boundaries(
+    tmp_path: Path,
+) -> None:
+    from run_a2v_broad_provider import ProviderExecutionError, extract_unique_fal_key
+
+    fake_key = "44444444-4444-4444-4444-444444444444:" + "5" * 32
+    source = tmp_path / "private-database.sqlite"
+    source.write_bytes(b"record-prefix-x" + fake_key.encode("ascii") + b"y-record-tail")
+
+    try:
+        result = extract_unique_fal_key(source)
+    except ProviderExecutionError:
+        pytest.fail("binary database record bytes must not hide the unique credential")
+
+    assert result == fake_key
+
+
+def test_credential_reader_selects_one_key_by_full_sha256(tmp_path: Path) -> None:
+    from run_a2v_broad_provider import extract_unique_fal_key
+
+    first = "66666666-6666-6666-6666-666666666666:" + "7" * 32
+    selected = "88888888-8888-8888-8888-888888888888:" + "9" * 32
+    source = tmp_path / "private-database.sqlite"
+    source.write_bytes(first.encode("ascii") + b"\x00" + selected.encode("ascii"))
+    expected_sha256 = hashlib.sha256(selected.encode("ascii")).hexdigest()
+
+    assert extract_unique_fal_key(source, expected_sha256=expected_sha256) == selected
 
 
 def test_expected_cost_is_derived_from_the_only_two_allowed_step_counts() -> None:
