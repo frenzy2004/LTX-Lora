@@ -111,6 +111,19 @@ def test_crop_rejects_insufficient_face_detection_coverage() -> None:
     assert decision.detection_coverage == 0.25
 
 
+def test_map_proxy_crop_back_to_display_coordinates() -> None:
+    from a2v_broad_dataset import Crop, map_crop_to_display
+
+    mapped = map_crop_to_display(
+        Crop(x=54, y=96, width=432, height=768),
+        proxy_size=(540, 960),
+        display_size=(2160, 3840),
+    )
+
+    assert mapped == Crop(x=216, y=384, width=1728, height=3072)
+    assert abs(mapped.width / mapped.height - 9 / 16) < 0.001
+
+
 def test_render_group_preserves_exact_a2v_contract() -> None:
     from a2v_broad_dataset import Crop, Window, render_group, validate_group
 

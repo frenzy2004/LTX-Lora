@@ -588,6 +588,44 @@ def _even_clamped_origin(value: float, maximum: int) -> int:
     return max(0, min(maximum, int(round(value / 2.0) * 2)))
 
 
+def map_crop_to_display(
+    crop: Crop,
+    *,
+    proxy_size: tuple[int, int],
+    display_size: tuple[int, int],
+) -> Crop:
+    """Map a crop derived on a downscaled proxy back to display coordinates."""
+
+    proxy_width, proxy_height = proxy_size
+    display_width, display_height = display_size
+    if min(proxy_width, proxy_height, display_width, display_height) < 2:
+        raise ValueError("proxy and display dimensions must be positive")
+    if (
+        crop.x < 0
+        or crop.y < 0
+        or crop.width < 2
+        or crop.height < 2
+        or crop.x + crop.width > proxy_width
+        or crop.y + crop.height > proxy_height
+    ):
+        raise ValueError("proxy crop lies outside the proxy frame")
+    proxy_aspect = proxy_width / proxy_height
+    display_aspect = display_width / display_height
+    if abs(proxy_aspect - display_aspect) / display_aspect > 0.01:
+        raise ValueError("proxy and display aspect ratios do not match")
+
+    scale = display_height / proxy_height
+    width = min(display_width, _even_ceil(crop.width * scale))
+    height = min(display_height, _even_ceil(crop.height * scale))
+    if width % 2:
+        width -= 1
+    if height % 2:
+        height -= 1
+    x = _even_clamped_origin(crop.x * scale, display_width - width)
+    y = _even_clamped_origin(crop.y * scale, display_height - height)
+    return Crop(x=x, y=y, width=width, height=height)
+
+
 def derive_portrait_crop(
     frame_size: tuple[int, int],
     observations: Sequence[FaceObservation],
