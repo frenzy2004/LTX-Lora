@@ -89,6 +89,8 @@ The normal-colour local dataset is authoritative. The provider mirror inverts on
 - Persist every provider-emitted progress, validation, warning, and loss field. Record `provider_loss_not_exposed` when no loss is emitted; never fabricate accuracy.
 - Model accuracy is the held-out acceptance rate under identity, mouth/jaw synchronization, temporal stability, and obvious-AI-artifact criteria.
 
+`tools/run_a2v_broad_provider.py` implements that boundary independently of the older 1,000-step execution contract. It accepts only 100 or 4,000 steps, derives the reservation from the pinned rate, requires current official price evidence, blocks any existing paid request, persists a submit intent before the sole non-retrying POST, records provider telemetry/loss observations verbatim, and treats ambiguous submission as non-retriable. A completed monitor call is idempotent.
+
 ## Security and Publication
 
 Git receives only this design, the reusable builder/tests, sanitized aggregate counts/hashes, provider telemetry without private identifiers, cost summaries, and honest evaluation results. Raw video, audio, captions containing transcript content, face images, private paths, trigger tokens, request IDs, signed URLs, credentials, LoRA weights, and provider artifact URLs remain private.

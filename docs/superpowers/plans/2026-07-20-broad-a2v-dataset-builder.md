@@ -253,6 +253,8 @@ Print passing source/group/holdout counts and aggregate exclusion reasons. Do no
 ### Task 6: Provider decoding gate, 4,000-step run, and evaluation
 
 **Files:**
+- Create: `tools/run_a2v_broad_provider.py`
+- Create: `tests/test_run_a2v_broad_provider.py`
 - Create privately at runtime: `projects/a2v-participant-broad-4000-20260719-2146/outputs/provider-debug-100/`
 - Create privately at runtime: `projects/a2v-participant-broad-4000-20260719-2146/outputs/provider-main-4000/`
 - Create Git-safe: `results/BROAD_A2V_4000_EVALUATION.md`
