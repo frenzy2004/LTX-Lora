@@ -745,10 +745,13 @@ def monitor_run(
     if not state_path.is_file():
         raise ProviderExecutionError("execution state is unavailable")
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    if state.get("phase") == "completed":
+    if state.get("phase") in {
+        "completed",
+        "completed_without_retrievable_result",
+    }:
         artifacts = state.get("artifacts", {})
         return {
-            "phase": "completed",
+            "phase": state["phase"],
             "provider_status": "completed",
             "provider_loss_status": state.get("provider_loss_status"),
             "provider_loss_observation_count": state.get(
@@ -814,7 +817,45 @@ def monitor_run(
             "reserved_amount_usd": state.get("reserved_amount_usd"),
         }
 
-    result = result_fn(key, request_id)
+    try:
+        result = result_fn(key, request_id)
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        if getattr(response, "status_code", None) != 404:
+            raise
+        final_loss_status = (
+            "exposed"
+            if telemetry["loss_observations"]
+            else "provider_loss_not_exposed"
+        )
+        outcome = "completed_without_retrievable_result"
+        state.update(
+            {
+                "phase": outcome,
+                "completed_at_utc": observed_at,
+                "provider_loss_status": final_loss_status,
+                "provider_result_status_code": 404,
+                "artifacts": {},
+            }
+        )
+        atomic_write_json(state_path, state)
+        update_budget_entry(
+            budget_path,
+            str(state["budget_label"]),
+            "charged_expected",
+            completed_at_utc=observed_at,
+            provider_outcome=outcome,
+        )
+        return {
+            "phase": outcome,
+            "provider_status": status_name,
+            "provider_loss_status": final_loss_status,
+            "provider_loss_observation_count": len(
+                telemetry["loss_observations"]
+            ),
+            "reserved_amount_usd": state.get("reserved_amount_usd"),
+            "artifacts": [],
+        }
     if not isinstance(result, dict):
         raise ProviderExecutionError("provider result has an unexpected shape")
     atomic_write_json(state_dir / "result.private.json", result)

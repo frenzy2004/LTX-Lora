@@ -437,6 +437,112 @@ def test_completed_monitor_records_missing_provider_loss_without_fabrication(
     assert persisted_budget["entries"][0]["status"] == "charged_expected"
 
 
+def test_completed_monitor_records_expired_result_without_resubmission(
+    tmp_path: Path,
+) -> None:
+    from run_a2v_broad_provider import monitor_run
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "execution.private.json").write_text(
+        json.dumps(
+            {
+                "application": "fal-ai/ltx23-trainer-v2/a2v",
+                "budget_label": "broad_a2v_main_4000",
+                "phase": "submitted",
+                "request_id": "private-request-id",
+                "reserved_amount_usd": 24.0,
+                "steps": 4_000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    budget = tmp_path / "budget.json"
+    budget.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {
+                        "label": "broad_a2v_main_4000",
+                        "amount_usd": 24.0,
+                        "status": "submitted",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    key_source = tmp_path / "key.txt"
+    key_source.write_text(
+        "12345678-1234-1234-1234-123456789abc:" + "a" * 32,
+        encoding="utf-8",
+    )
+    request = httpx.Request("GET", "https://queue.example/result")
+    response = httpx.Response(404, request=request)
+    calls = {"status": 0, "result": 0}
+
+    def completed_status(_key: str, _request_id: str) -> dict[str, object]:
+        calls["status"] += 1
+        return {
+            "status": "completed",
+            "logs": [
+                {"message": "Lora weights for step 4000 saved"},
+                {"message": "Training complete, collecting artifacts..."},
+            ],
+        }
+
+    def expired_result(_key: str, _request_id: str) -> dict[str, object]:
+        calls["result"] += 1
+        raise httpx.HTTPStatusError(
+            "request not found",
+            request=request,
+            response=response,
+        )
+
+    output = monitor_run(
+        state_dir=state_dir,
+        budget_path=budget,
+        key_source=key_source,
+        status_fn=completed_status,
+        result_fn=expired_result,
+        now=datetime(2026, 7, 20, 15, 0, tzinfo=timezone.utc),
+    )
+
+    assert output == {
+        "phase": "completed_without_retrievable_result",
+        "provider_status": "completed",
+        "provider_loss_status": "provider_loss_not_exposed",
+        "provider_loss_observation_count": 0,
+        "reserved_amount_usd": 24.0,
+        "artifacts": [],
+    }
+    assert calls == {"status": 1, "result": 1}
+    state = json.loads((state_dir / "execution.private.json").read_text())
+    assert state["phase"] == "completed_without_retrievable_result"
+    assert state["provider_result_status_code"] == 404
+    persisted_budget = json.loads(budget.read_text())
+    assert persisted_budget["entries"][0]["status"] == "charged_expected"
+    assert (
+        persisted_budget["entries"][0]["provider_outcome"]
+        == "completed_without_retrievable_result"
+    )
+
+    second = monitor_run(
+        state_dir=state_dir,
+        budget_path=tmp_path / "unused-budget.json",
+        key_source=tmp_path / "unused-key.txt",
+        status_fn=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("terminal status must not be polled twice")
+        ),
+        result_fn=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("expired result must not be fetched twice")
+        ),
+    )
+
+    assert second["phase"] == "completed_without_retrievable_result"
+    assert calls == {"status": 1, "result": 1}
+
+
 def test_run_config_resolves_private_validation_inputs_from_its_directory(
     tmp_path: Path,
 ) -> None:
