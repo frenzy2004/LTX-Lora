@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import hashlib
 import random
@@ -588,6 +589,42 @@ def _even_clamped_origin(value: float, maximum: int) -> int:
     return max(0, min(maximum, int(round(value / 2.0) * 2)))
 
 
+def _exact_even_aspect_dimensions(
+    *,
+    minimum_width: float,
+    minimum_height: float,
+    maximum_width: int,
+    maximum_height: int,
+    aspect: Fraction,
+) -> tuple[int, int]:
+    """Return even dimensions that exactly preserve a reduced aspect ratio."""
+
+    if (
+        minimum_width <= 0
+        or minimum_height <= 0
+        or maximum_width < 2
+        or maximum_height < 2
+        or aspect <= 0
+    ):
+        raise ValueError("aspect dimensions must be positive")
+    width_unit = aspect.numerator
+    height_unit = aspect.denominator
+    unit_step = 2 if width_unit % 2 or height_unit % 2 else 1
+    required_units = ceil(
+        max(minimum_width / width_unit, minimum_height / height_unit)
+        / unit_step
+    ) * unit_step
+    maximum_units = min(
+        maximum_width // width_unit,
+        maximum_height // height_unit,
+    )
+    maximum_units -= maximum_units % unit_step
+    if maximum_units < unit_step:
+        raise ValueError("frame is too small for the requested even aspect ratio")
+    units = min(required_units, maximum_units)
+    return width_unit * units, height_unit * units
+
+
 def map_crop_to_display(
     crop: Crop,
     *,
@@ -614,15 +651,19 @@ def map_crop_to_display(
     if abs(proxy_aspect - display_aspect) / display_aspect > 0.01:
         raise ValueError("proxy and display aspect ratios do not match")
 
-    scale = display_height / proxy_height
-    width = min(display_width, _even_ceil(crop.width * scale))
-    height = min(display_height, _even_ceil(crop.height * scale))
-    if width % 2:
-        width -= 1
-    if height % 2:
-        height -= 1
-    x = _even_clamped_origin(crop.x * scale, display_width - width)
-    y = _even_clamped_origin(crop.y * scale, display_height - height)
+    scale_x = display_width / proxy_width
+    scale_y = display_height / proxy_height
+    width, height = _exact_even_aspect_dimensions(
+        minimum_width=crop.width * scale_x,
+        minimum_height=crop.height * scale_y,
+        maximum_width=display_width,
+        maximum_height=display_height,
+        aspect=Fraction(crop.width, crop.height),
+    )
+    center_x = (crop.x + crop.width / 2) * scale_x
+    center_y = (crop.y + crop.height / 2) * scale_y
+    x = _even_clamped_origin(center_x - width / 2, display_width - width)
+    y = _even_clamped_origin(center_y - height / 2, display_height - height)
     return Crop(x=x, y=y, width=width, height=height)
 
 
@@ -630,7 +671,7 @@ def derive_portrait_crop(
     frame_size: tuple[int, int],
     observations: Sequence[FaceObservation],
     *,
-    output_aspect: float = 9 / 16,
+    output_aspect: float = 544 / 960,
     target_face_height_ratio: float = 0.28,
     minimum_detection_coverage: float = 0.75,
     prominent_second_face_ratio: float = 0.35,
@@ -676,12 +717,13 @@ def derive_portrait_crop(
         crop_width = float(frame_width)
         crop_height = crop_width / output_aspect
 
-    width = min(frame_width, _even_ceil(crop_width))
-    height = min(frame_height, _even_ceil(crop_height))
-    if width % 2:
-        width -= 1
-    if height % 2:
-        height -= 1
+    width, height = _exact_even_aspect_dimensions(
+        minimum_width=crop_width,
+        minimum_height=crop_height,
+        maximum_width=frame_width,
+        maximum_height=frame_height,
+        aspect=Fraction(str(output_aspect)).limit_denominator(1_000),
+    )
 
     face_center_x = median(box.center_x for box in boxes)
     face_center_y = median(box.center_y for box in boxes)
@@ -800,3 +842,345 @@ def select_speech_windows(
         if len(selected) == max_windows:
             break
     return sorted(selected, key=lambda window: window.start)
+
+
+def _write_json_atomic(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _safe_relative_source(root: Path, relative: str) -> Path:
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError("source_relative_path must stay inside source root")
+    candidate = (root / relative_path).resolve(strict=True)
+    candidate.relative_to(root)
+    if not candidate.is_file():
+        raise FileNotFoundError(candidate)
+    return candidate
+
+
+def _directory_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def _normalise_approved_windows(payload: object) -> list[dict[str, object]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("windows"), list):
+        raise ValueError("approved manifest must contain a windows list")
+    accepted: list[dict[str, object]] = []
+    seen: set[tuple[str, int]] = set()
+    expected_duration = 89 / 24
+    for raw in payload["windows"]:
+        if not isinstance(raw, dict):
+            raise ValueError("every approved window must be an object")
+        if raw.get("visual_status") != "accepted":
+            raise ValueError("every planned window requires explicit visual acceptance")
+        source_id = str(raw.get("source_id", "")).strip()
+        relative = str(raw.get("source_relative_path", "")).strip()
+        caption = str(raw.get("caption", "")).strip()
+        window_index = int(raw.get("window_index", 0))
+        start = float(raw.get("start", -1))
+        end = float(raw.get("end", -1))
+        crop_payload = raw.get("crop")
+        if not source_id or not relative or not caption or window_index < 1 or start < 0:
+            raise ValueError("approved window metadata is incomplete")
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError("source_relative_path must be safe and relative")
+        if abs((end - start) - expected_duration) > 1e-6:
+            raise ValueError("approved window does not match the 89-frame duration")
+        if not isinstance(crop_payload, dict):
+            raise ValueError("approved window is missing its crop")
+        crop = Crop(
+            x=int(crop_payload.get("x", -1)),
+            y=int(crop_payload.get("y", -1)),
+            width=int(crop_payload.get("width", 0)),
+            height=int(crop_payload.get("height", 0)),
+        )
+        if (
+            crop.x < 0
+            or crop.y < 0
+            or crop.width < 2
+            or crop.height < 2
+            or any(value % 2 for value in (crop.x, crop.y, crop.width, crop.height))
+        ):
+            raise ValueError("crop coordinates and dimensions must be nonnegative/even")
+        if crop.width * 30 != crop.height * 17:
+            raise ValueError("crop aspect must exactly match the 544x960 bucket")
+        key = (source_id, window_index)
+        if key in seen:
+            raise ValueError(f"duplicate approved window: {source_id} w{window_index}")
+        seen.add(key)
+        accepted.append(
+            {
+                "source_id": source_id,
+                "source_relative_path": relative_path.as_posix(),
+                "window_index": window_index,
+                "start": start,
+                "end": end,
+                "word_count": int(raw.get("word_count", 0)),
+                "speech_seconds": float(raw.get("speech_seconds", 0.0)),
+                "crop": {
+                    "x": crop.x,
+                    "y": crop.y,
+                    "width": crop.width,
+                    "height": crop.height,
+                },
+                "caption": caption,
+                "visual_status": "accepted",
+            }
+        )
+    if len({str(item["source_id"]) for item in accepted}) < 2:
+        raise ValueError("at least two visually accepted source files are required")
+    return sorted(
+        accepted,
+        key=lambda item: (str(item["source_id"]), int(item["window_index"])),
+    )
+
+
+def build_dataset_plan(
+    approved_windows: Sequence[dict[str, object]],
+    *,
+    projected_bytes_per_group: int,
+    max_derived_bytes: int,
+    holdout_fraction: float = 0.10,
+    min_holdout: int = 5,
+    seed: int = 42,
+) -> dict[str, object]:
+    """Split visually approved windows by source and enforce the size ceiling."""
+
+    if projected_bytes_per_group < 1 or max_derived_bytes < 1:
+        raise ValueError("workspace size limits must be positive")
+    source_ids = sorted({str(item["source_id"]) for item in approved_windows})
+    train_sources, holdout_sources = split_sources(
+        source_ids,
+        holdout_fraction=holdout_fraction,
+        min_holdout=min_holdout,
+        seed=seed,
+    )
+    train_set = set(train_sources)
+    holdout_set = set(holdout_sources)
+    training: list[dict[str, object]] = []
+    holdout: list[dict[str, object]] = []
+    for item in approved_windows:
+        source_id = str(item["source_id"])
+        target = training if source_id in train_set else holdout
+        if source_id not in train_set and source_id not in holdout_set:
+            raise ValueError(f"source missing from split: {source_id}")
+        planned = dict(item)
+        prefix = "train" if target is training else "holdout"
+        planned["basename"] = f"{prefix}_{len(target) + 1:03d}"
+        target.append(planned)
+    if {str(item["source_id"]) for item in training} & {
+        str(item["source_id"]) for item in holdout
+    }:
+        raise ValueError("training and holdout sources overlap")
+    projected_size = len(approved_windows) * projected_bytes_per_group
+    if projected_size > max_derived_bytes:
+        raise ValueError(
+            "projected derived data exceeds the configured workspace ceiling: "
+            f"{projected_size} > {max_derived_bytes}"
+        )
+    return {
+        "schema_version": 1,
+        "bucket": {"width": 544, "height": 960, "frames": 89, "fps": 24},
+        "split": {
+            "seed": seed,
+            "holdout_fraction": holdout_fraction,
+            "min_holdout": min_holdout,
+        },
+        "source_count": len(source_ids),
+        "training_source_count": len(train_sources),
+        "holdout_source_count": len(holdout_sources),
+        "training_group_count": len(training),
+        "holdout_group_count": len(holdout),
+        "projected_bytes_per_group": projected_bytes_per_group,
+        "projected_derived_bytes": projected_size,
+        "max_derived_bytes": max_derived_bytes,
+        "training": training,
+        "holdout": holdout,
+    }
+
+
+def _render_planned_group(
+    item: dict[str, object],
+    *,
+    source_root: Path,
+    destination: Path,
+) -> GroupAudit:
+    source = _safe_relative_source(source_root, str(item["source_relative_path"]))
+    crop_payload = item["crop"]
+    if not isinstance(crop_payload, dict):
+        raise ValueError("planned crop is invalid")
+    paths = _paths_for_basename(destination, str(item["basename"]))
+    membership = [path.is_file() for path in paths.__dict__.values()]
+    if all(membership):
+        return validate_group(paths)
+    if any(membership):
+        raise ValueError(f"partial existing group: {item['basename']}")
+    return validate_group(
+        render_group(
+            source=source,
+            window=Window(
+                start=float(item["start"]),
+                end=float(item["end"]),
+                word_count=int(item["word_count"]),
+                speech_seconds=float(item["speech_seconds"]),
+            ),
+            crop=Crop(
+                x=int(crop_payload["x"]),
+                y=int(crop_payload["y"]),
+                width=int(crop_payload["width"]),
+                height=int(crop_payload["height"]),
+            ),
+            destination=destination,
+            basename=str(item["basename"]),
+            caption=str(item["caption"]),
+        )
+    )
+
+
+def render_dataset_plan(
+    plan: dict[str, object],
+    *,
+    source_root: Path,
+    output_root: Path,
+) -> dict[str, object]:
+    """Render canonical groups and the provider-only mirror under a hard ceiling."""
+
+    source_root = source_root.resolve(strict=True)
+    output_root.mkdir(parents=True, exist_ok=True)
+    max_bytes = int(plan["max_derived_bytes"])
+    training_dir = output_root / "canonical-training"
+    holdout_dir = output_root / "canonical-holdout"
+    audits: list[dict[str, object]] = []
+    for split_name, destination in (
+        ("training", training_dir),
+        ("holdout", holdout_dir),
+    ):
+        items = plan.get(split_name)
+        if not isinstance(items, list):
+            raise ValueError(f"plan is missing {split_name} items")
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("planned group must be an object")
+            audit = _render_planned_group(
+                item,
+                source_root=source_root,
+                destination=destination,
+            )
+            audits.append(
+                {
+                    "basename": item["basename"],
+                    "split": split_name,
+                    "width": audit.width,
+                    "height": audit.height,
+                    "frames": audit.frames,
+                    "fps": str(audit.fps),
+                    "audio_rate": audit.audio_rate,
+                    "audio_channels": audit.audio_channels,
+                    "audio_samples": audit.audio_samples,
+                    "start_matches_target_first_frame": audit.start_matches_target_first_frame,
+                    "target_has_audio": audit.target_has_audio,
+                }
+            )
+            current_size = _directory_size(output_root)
+            if current_size > max_bytes:
+                raise ValueError(
+                    "rendered derived data exceeded the workspace ceiling: "
+                    f"{current_size} > {max_bytes}"
+                )
+
+    mirror_dir = output_root / "provider-mirror"
+    if mirror_dir.exists() and any(mirror_dir.iterdir()):
+        raise ValueError("provider mirror already exists and is not empty")
+    mirror = build_provider_mirror(training_dir, mirror_dir)
+    archive = write_training_archive(
+        mirror_dir,
+        output_root / "provider-training.zip",
+    )
+    actual_size = _directory_size(output_root)
+    if actual_size > max_bytes:
+        raise ValueError(
+            "completed derived data exceeded the workspace ceiling: "
+            f"{actual_size} > {max_bytes}"
+        )
+    return {
+        "schema_version": 1,
+        "group_audits": audits,
+        "mirror": {
+            "group_count": mirror.group_count,
+            "audio_sha256_equal": mirror.audio_sha256_equal,
+            "caption_sha256_equal": mirror.caption_sha256_equal,
+            "visual_inverse_mean_absolute_error": mirror.visual_inverse_mean_absolute_error,
+        },
+        "archive": {
+            "group_count": archive.group_count,
+            "file_count": archive.file_count,
+            "size_bytes": archive.size_bytes,
+            "sha256": archive.sha256,
+        },
+        "actual_derived_bytes": actual_size,
+        "max_derived_bytes": max_bytes,
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Build a source-isolated broad A2V training archive."
+    )
+    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--approved-manifest", type=Path, required=True)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--projected-bytes-per-group",
+        type=int,
+        default=64 * 1024 * 1024,
+    )
+    parser.add_argument(
+        "--max-derived-bytes",
+        type=int,
+        default=8 * 1024 * 1024 * 1024,
+    )
+    parser.add_argument("--holdout-fraction", type=float, default=0.10)
+    parser.add_argument("--min-holdout", type=int, default=5)
+    parser.add_argument("--seed", type=int, default=42)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--render", action="store_true")
+    args = parser.parse_args(argv)
+
+    approved_payload = json.loads(
+        args.approved_manifest.resolve(strict=True).read_text(encoding="utf-8")
+    )
+    approved = _normalise_approved_windows(approved_payload)
+    plan = build_dataset_plan(
+        approved,
+        projected_bytes_per_group=args.projected_bytes_per_group,
+        max_derived_bytes=args.max_derived_bytes,
+        holdout_fraction=args.holdout_fraction,
+        min_holdout=args.min_holdout,
+        seed=args.seed,
+    )
+    output_root = args.output_root.resolve()
+    _write_json_atomic(output_root / "dataset-plan.private.json", plan)
+    if args.dry_run:
+        return 0
+    build = render_dataset_plan(
+        plan,
+        source_root=args.source_root,
+        output_root=output_root,
+    )
+    _write_json_atomic(output_root / "dataset-build.private.json", build)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

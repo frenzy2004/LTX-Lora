@@ -44,7 +44,7 @@ The implementation is split into focused units:
 
 - Detect faces on frames sampled through the complete proposed interval.
 - Reject a window when no stable primary face is found, a second similarly sized face is prominent, or detection coverage is below the configured threshold.
-- Derive one fixed 9:16 crop from the primary face envelope. A fixed crop avoids synthetic camera jitter while retaining the full hair, jaw, and observed head-motion envelope.
+- Derive one fixed crop at the exact 544:960 bucket aspect (17:30, approximately 9:16) from the primary face envelope. Matching the actual output bucket prevents subtle anisotropic face stretching. A fixed crop avoids synthetic camera jitter while retaining the full hair, jaw, and observed head-motion envelope.
 - Scale to 544×960 with Lanczos resampling.
 - Reject crops that clip the face envelope or leave the median face too small for the talking-head target.
 - Store crop coordinates and aggregate detection metrics only in the private manifest.
@@ -72,6 +72,8 @@ Mechanical validation is all-or-nothing:
 - train/holdout source disjointness;
 - archive membership and SHA-256 manifest;
 - workspace derived-data ceiling of 8 GiB.
+
+The private orchestration CLI performs a metadata-only dry run before rendering. It rejects any planned crop that does not exactly match the 544:960 bucket, enforces explicit visual acceptance, splits by source, estimates total derived size, and refuses to create media when the 8 GiB projection is exceeded.
 
 Visual review sheets show sampled real target frames, face boxes/crop envelope, face-size and detection-coverage summaries, and inclusion/exclusion status. They do not show IC-LoRA Canny controls because A2V has no reference-video control input.
 

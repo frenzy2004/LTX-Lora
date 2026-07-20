@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Canonical target: 544×960, 89 frames, 24 fps, silent H.264 target plus mono 48 kHz PCM WAV.
+- Canonical target: 544×960, 89 frames, 24 fps, silent H.264 target plus mono 48 kHz PCM WAV. Face-aware crops use the exact 17:30 bucket aspect (approximately 9:16) to prevent anisotropic face stretching during resize.
 - Train/holdout separation is by source file; seed 42; roughly 10 percent holdout with minimum five when the passing source count permits.
 - The normal-colour local dataset is authoritative; a provider-only pre-inverted mirror exists solely to counter the previously measured Fal channel inversion.
 - A 100-step provider-decoding gate must pass before one 4,000-step, rank-32, learning-rate-0.0001 request.
