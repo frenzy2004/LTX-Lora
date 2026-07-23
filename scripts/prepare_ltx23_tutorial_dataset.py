@@ -64,6 +64,17 @@ def _make_window(segments: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _spread_windows(windows: list[dict[str, Any]], target_count: int) -> list[dict[str, Any]]:
+    sorted_windows = sorted(windows, key=lambda window: float(window["start"]))
+    if len(sorted_windows) <= target_count:
+        return sorted_windows
+    if target_count == 1:
+        return [sorted_windows[len(sorted_windows) // 2]]
+    step = (len(sorted_windows) - 1) / (target_count - 1)
+    indexes = [round(index * step) for index in range(target_count)]
+    return [sorted_windows[index] for index in indexes]
+
+
 def choose_clip_windows(
     segments: list[dict[str, Any]],
     *,
@@ -96,8 +107,6 @@ def choose_clip_windows(
                 windows.append(window)
                 seen.add(key)
                 break
-        if len(windows) == target_count:
-            return windows
 
     for segment in ordered:
         duration = _segment_duration(segment)
@@ -109,11 +118,9 @@ def choose_clip_windows(
         )
         if min_seconds <= duration <= max_seconds and len(text) >= 12 and key not in seen and not overlaps_existing:
             windows.append(_make_window([segment]))
-            if len(windows) == target_count:
-                return windows
 
     if len(windows) >= target_count:
-        return windows[:target_count]
+        return _spread_windows(windows, target_count)
 
     for index, segment in enumerate(ordered):
         group = [segment]
@@ -134,10 +141,10 @@ def choose_clip_windows(
                     windows.append(window)
                     seen.add(key)
                 break
-        if len(windows) == target_count:
-            return sorted(windows, key=lambda window: float(window["start"]))
+        if len(windows) >= target_count:
+            return _spread_windows(windows, target_count)
 
-    return sorted(windows, key=lambda window: float(window["start"]))[:target_count]
+    return _spread_windows(windows, target_count)
 
 
 def render_clip(ffmpeg: str, source_video: Path, destination: Path, start: float, duration: float) -> None:
