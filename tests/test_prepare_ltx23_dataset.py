@@ -43,3 +43,16 @@ def test_choose_clip_windows_combines_short_neighbors() -> None:
     assert windows[0]["start"] == 1.0
     assert windows[0]["end"] == 4.2
     assert "First short line, then it becomes useful." in str(windows[0]["caption"])
+
+
+def test_choose_clip_windows_skips_profane_and_duplicate_text() -> None:
+    segments = [
+        {"start": 1.0, "end": 4.0, "text": "This line has a badword token."},
+        {"start": 5.0, "end": 8.0, "text": "A clean reusable sentence."},
+        {"start": 9.0, "end": 12.0, "text": "A clean reusable sentence."},
+        {"start": 13.0, "end": 16.0, "text": "A second clean sentence."},
+    ]
+
+    windows = choose_clip_windows(segments, target_count=2, min_seconds=2.0, max_seconds=8.0)
+
+    assert [window["text"] for window in windows] == ["A clean reusable sentence.", "A second clean sentence."]

@@ -12,6 +12,7 @@ from ltx_lora_pilot.ltx23_v2 import TRIGGER
 
 
 BLOCKED_NAME_TOKENS = {"realname", "surname"}
+BLOCKED_CAPTION_TOKENS = {"badword", "fuck", "fucking", "shit"}
 
 
 def _clip_filter() -> str:
@@ -30,6 +31,15 @@ def _clean_text(text: str) -> str:
     cleaned = text.replace('"', "")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def _normalized_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _is_usable_text(text: str) -> bool:
+    normalized_words = set(_normalized_text(text).split())
+    return not (normalized_words & BLOCKED_CAPTION_TOKENS)
 
 
 def sanitize_caption(text: str) -> str:
@@ -85,10 +95,11 @@ def choose_clip_windows(
     windows: list[dict[str, Any]] = []
     ordered = sorted(segments, key=lambda segment: float(segment["start"]))
     seen = set()
+    seen_texts = set()
 
     for index, segment in enumerate(ordered):
         text = _clean_text(str(segment.get("text", "")))
-        if _segment_duration(segment) >= min_seconds or text.endswith((".", "?", "!")):
+        if _segment_duration(segment) >= min_seconds or text.endswith((".", "?", "!")) or not _is_usable_text(text):
             continue
         group = [segment]
         end = float(segment["end"])
@@ -104,20 +115,33 @@ def choose_clip_windows(
             if duration >= min_seconds:
                 window = _make_window(group)
                 key = (round(float(window["start"]), 3), round(float(window["end"]), 3))
+                text_key = _normalized_text(str(window["text"]))
+                if not _is_usable_text(str(window["text"])) or text_key in seen_texts:
+                    break
                 windows.append(window)
                 seen.add(key)
+                seen_texts.add(text_key)
                 break
 
     for segment in ordered:
         duration = _segment_duration(segment)
         text = _clean_text(str(segment.get("text", "")))
+        text_key = _normalized_text(text)
         key = (round(float(segment["start"]), 3), round(float(segment["end"]), 3))
         overlaps_existing = any(
             float(window["start"]) < float(segment["end"]) and float(segment["start"]) < float(window["end"])
             for window in windows
         )
-        if min_seconds <= duration <= max_seconds and len(text) >= 12 and key not in seen and not overlaps_existing:
+        if (
+            min_seconds <= duration <= max_seconds
+            and len(text) >= 12
+            and key not in seen
+            and not overlaps_existing
+            and text_key not in seen_texts
+            and _is_usable_text(text)
+        ):
             windows.append(_make_window([segment]))
+            seen_texts.add(text_key)
 
     if len(windows) >= target_count:
         return _spread_windows(windows, target_count)
@@ -137,9 +161,11 @@ def choose_clip_windows(
             if duration >= min_seconds:
                 window = _make_window(group)
                 key = (round(float(window["start"]), 3), round(float(window["end"]), 3))
-                if key not in seen:
+                text_key = _normalized_text(str(window["text"]))
+                if key not in seen and text_key not in seen_texts and _is_usable_text(str(window["text"])):
                     windows.append(window)
                     seen.add(key)
+                    seen_texts.add(text_key)
                 break
         if len(windows) >= target_count:
             return _spread_windows(windows, target_count)
