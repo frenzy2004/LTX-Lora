@@ -1,0 +1,45 @@
+{
+  "name": "raindeer-videoclaw-take2-20s",
+  "created_date": "2026-07-24",
+  "workflow": "Raindeer/LTX round-1 identity with VideoClaw retrofit and gbro-style burger cutaway",
+  "output": "results/videos/raindeer-videoclaw-take2-20s.mp4",
+  "contact_sheet": "results/videos/raindeer-videoclaw-take2-20s-contact.jpg",
+  "duration_seconds": 20.053,
+  "resolution": {
+    "width": 720,
+    "height": 1280
+  },
+  "fps": 30,
+  "frames": 600,
+  "sources": [
+    {
+      "role": "round_1_raindeer_identity_lora",
+      "path": "work/ltx23_orvo/fal/training_500_result.json"
+    },
+    {
+      "role": "round_1_burger_hook",
+      "path": "outputs/ltx23_orvo_round1_burger/ltx23_orvo_round1_burger_10s_i2v.mp4"
+    },
+    {
+      "role": "fresh_ltx_raindeer_bite_verdict",
+      "path": "outputs/raindeer_videoclaw_take2/raindeer_round1_burger_verdict_10s_i2v.mp4"
+    },
+    {
+      "role": "videoclaw_gbro_style_cutaway",
+      "path": "jobs/raindeer-burger-review-20260724-vc1/broll/burger_score_cutaway.mp4"
+    }
+  ],
+  "cost_usd_new": 3.33866,
+  "paid_calls": {
+    "new_lora_training": false,
+    "fresh_ltx_i2v_continuation": 0.61,
+    "videoclaw_insert_render": 2.728,
+    "videoclaw_transcription": 0.00066
+  },
+  "notes": [
+    "No secrets are stored in this manifest.",
+    "Raindeer/LTX supplies the character identity.",
+    "VideoClaw supplies the cutaway/post-production layer.",
+    "The VideoClaw cutaway was cropped and trim-held locally to remove accidental readable panel text."
+  ]
+}
