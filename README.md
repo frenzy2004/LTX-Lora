@@ -60,13 +60,22 @@ This is a dry run. Add `--execute` only after the projected request cost and rem
 
 See [docs/TEST_PLAN.md](docs/TEST_PLAN.md) for acceptance criteria.
 
+## Raindeer workflow
+
+The first three LTX 2.3 character-LoRA rounds have been captured as the **Raindeer** workflow: train one character adapter, render the same proof matrix, compare, then tighten the next dataset. See [docs/RAINDEER_WORKFLOW.md](docs/RAINDEER_WORKFLOW.md).
+
+```powershell
+python scripts/raindeer.py plan
+```
+
 ## Current evidence
 
-The first two fal generations are published under [`results/videos`](results/videos):
+Approved generated proof clips are published under [`results/videos`](results/videos):
 
 - `t2v-lora-prompt-only-identity-failure.mp4` documents that the 500-step adapter is not sufficient for prompt-only identity generation.
 - `i2v-lora-reference-conditioned.mp4` shows substantially stronger identity preservation when the same adapter is combined with an approved first-frame reference.
 - `a2v-lora-supplied-audio.mp4` tests an 11-second approved voice recording with the same first frame and adapter.
+- `raindeer-round-1-*.mp4`, `raindeer-round-2-*.mp4`, and `raindeer-round-3-*.mp4` publish the approved generated proof clips from the three Raindeer rounds.
 
 See [`results/EVALUATION.md`](results/EVALUATION.md) for the sanitized test record and current cost ledger.
 

@@ -26,11 +26,107 @@
       }
     },
     {
-      "filename": "t2v-lora-prompt-only-identity-failure.mp4",
-      "sha256": "4931530948986ea676496e63ca00838954deea5f92b1cabb6480365549498d35",
-      "bytes": 2332942,
-      "quality_status": "rejected_identity_failure",
-      "approval_date": "2026-07-14",
+      "filename": "raindeer-round-1-01-t2v.mp4",
+      "sha256": "bcc67ec02b2efe29cea46d8fb65a404fe95be09be4de021b7a1fc980518bd9bb",
+      "bytes": 641739,
+      "quality_status": "raindeer_round_proof",
+      "approval_date": "2026-07-24",
+      "manual_review": {
+        "output_classification": "generated_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
+    },
+    {
+      "filename": "raindeer-round-1-02-t2v.mp4",
+      "sha256": "44d6d947f452922f385de5cd5b35e7e6d971d5995d5193d2ab5a3f289c510bdf",
+      "bytes": 575920,
+      "quality_status": "raindeer_round_proof",
+      "approval_date": "2026-07-24",
+      "manual_review": {
+        "output_classification": "generated_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
+    },
+    {
+      "filename": "raindeer-round-1-03-i2v.mp4",
+      "sha256": "1814f86710f47219c4195265c244e414cb0e6dd55c66646872b119004c059d16",
+      "bytes": 704577,
+      "quality_status": "raindeer_round_proof",
+      "approval_date": "2026-07-24",
+      "manual_review": {
+        "output_classification": "generated_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
+    },
+    {
+      "filename": "raindeer-round-2-01-t2v.mp4",
+      "sha256": "fe49dacf601003697c31d984631eb020ec53fc71ed855119276010bed1d60ae8",
+      "bytes": 1054664,
+      "quality_status": "raindeer_round_proof",
+      "approval_date": "2026-07-24",
+      "manual_review": {
+        "output_classification": "generated_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
+    },
+    {
+      "filename": "raindeer-round-2-02-t2v.mp4",
+      "sha256": "9b8ebd5cb31c70ec9d77a786e26d55b6c9432c73a415f39870ed9d995c9c9cb5",
+      "bytes": 906956,
+      "quality_status": "raindeer_round_proof",
+      "approval_date": "2026-07-24",
+      "manual_review": {
+        "output_classification": "generated_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
+    },
+    {
+      "filename": "raindeer-round-2-03-i2v.mp4",
+      "sha256": "fed400613843e5d69becb5c2d730c73f2237e69e7d7651b0071688699c6096ba",
+      "bytes": 1719333,
+      "quality_status": "raindeer_round_proof",
+      "approval_date": "2026-07-24",
+      "manual_review": {
+        "output_classification": "generated_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
+    },
+    {
+      "filename": "raindeer-round-3-01-t2v.mp4",
+      "sha256": "fa56807e2f8343468a00af3cce3563faaa984b0e0ba0a298bb8a256d9ebeac11",
+      "bytes": 1285473,
+      "quality_status": "raindeer_round_proof",
+      "approval_date": "2026-07-24",
+      "manual_review": {
+        "output_classification": "generated_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
+    },
+    {
+      "filename": "raindeer-round-3-02-t2v.mp4",
+      "sha256": "9e1d6576115a6b9bb8cab185aec5e0d198fa5e584a3e26f03f6d30dac1fcda1b",
+      "bytes": 1414712,
+      "quality_status": "raindeer_round_proof",
+      "approval_date": "2026-07-24",
+      "manual_review": {
+        "output_classification": "generated_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
+    },
+    {
+      "filename": "raindeer-round-3-03-i2v.mp4",
+      "sha256": "82155f9b1da65a86c8c3a3909f6977ca41a6ef8806ced6109e5c9cbdfe59751d",
+      "bytes": 2003421,
+      "quality_status": "raindeer_round_proof",
+      "approval_date": "2026-07-24",
       "manual_review": {
         "output_classification": "generated_output",
         "consent_or_authorization": "confirmed",
@@ -45,6 +141,18 @@
       "approval_date": "2026-07-15",
       "manual_review": {
         "output_classification": "edited_real_footage_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
+    },
+    {
+      "filename": "t2v-lora-prompt-only-identity-failure.mp4",
+      "sha256": "4931530948986ea676496e63ca00838954deea5f92b1cabb6480365549498d35",
+      "bytes": 2332942,
+      "quality_status": "rejected_identity_failure",
+      "approval_date": "2026-07-14",
+      "manual_review": {
+        "output_classification": "generated_output",
         "consent_or_authorization": "confirmed",
         "embedded_source_asset_metadata": false
       }

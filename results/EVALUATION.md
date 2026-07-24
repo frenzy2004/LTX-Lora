@@ -27,6 +27,18 @@ Published clips:
 - [Supplied-audio talking-head test](videos/a2v-lora-supplied-audio.mp4)
 - [Preservation-first real-video control](videos/sync-v3-real-video-control.mp4)
 
+## Raindeer round proof set
+
+Raindeer is the tightened round-by-round workflow documented in [`docs/RAINDEER_WORKFLOW.md`](../docs/RAINDEER_WORKFLOW.md). The proof set excludes later burger/twin prompt experiments and contains only the three main character-LoRA rounds:
+
+| Round | Training | Proof clips | Review note |
+|---|---:|---|---|
+| 1 | 500 steps, about $3.00 | [01 T2V](videos/raindeer-round-1-01-t2v.mp4), [02 T2V](videos/raindeer-round-1-02-t2v.mp4), [03 I2V](videos/raindeer-round-1-03-i2v.mp4) | Strongest photorealistic reference look. |
+| 2 | 500 steps, about $3.00 | [01 T2V](videos/raindeer-round-2-01-t2v.mp4), [02 T2V](videos/raindeer-round-2-02-t2v.mp4), [03 I2V](videos/raindeer-round-2-03-i2v.mp4) | More synthetic; mixed source settings likely hurt consistency. |
+| 3 | 1000 steps, about $6.00 | [01 T2V](videos/raindeer-round-3-01-t2v.mp4), [02 T2V](videos/raindeer-round-3-02-t2v.mp4), [03 I2V](videos/raindeer-round-3-03-i2v.mp4) | Corridor-only data made the comparison cleaner. |
+
+Using the current megapixel-frame formula, each 121-frame quality proof render is about $0.3020 at the 1280×720 billing class. The reusable round estimate is therefore $3.9060 for a 500-step round with three proof renders, or $6.9060 for a 1,000-step round with three proof renders.
+
 ## Supplied-audio rejection
 
 The 11-second supplied-audio clip fails the indistinguishability gate and is not an acceptable production result. Manual review found visibly synthetic mouth motion, unstable lip shapes, jaw stretching, cheek deformation, eye and expression changes that did not track the speech naturally, and generated-looking facial texture. These defects remain apparent even though the subject is recognizable.
