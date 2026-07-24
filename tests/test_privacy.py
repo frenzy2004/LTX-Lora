@@ -103,6 +103,13 @@ APPROVED_PUBLIC_VIDEOS = {
         "approval_date": "2026-07-24",
         "output_classification": "generated_output",
     },
+    "raindeer-videoclaw-round1-burger-review-20s.mp4": {
+        "bytes": 3_229_437,
+        "sha256": "49cca58d1db34e03961c82402a23126689f132ab024d207538ae5211e85e2e6b",
+        "quality_status": "raindeer_round1_render_only_burger_review_proof",
+        "approval_date": "2026-07-24",
+        "output_classification": "generated_output",
+    },
     "t2v-lora-prompt-only-identity-failure.mp4": {
         "bytes": 2_332_942,
         "sha256": "4931530948986ea676496e63ca00838954deea5f92b1cabb6480365549498d35",

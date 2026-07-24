@@ -1,0 +1,51 @@
+{
+  "name": "raindeer-videoclaw-round1-burger-review-20s",
+  "created_date": "2026-07-24",
+  "workflow": "Raindeer round-1 render reuse with VideoClaw/gbro-style local collage composition",
+  "output": "results/videos/raindeer-videoclaw-round1-burger-review-20s.mp4",
+  "contact_sheet": "results/videos/raindeer-videoclaw-round1-burger-review-20s-contact.jpg",
+  "duration_seconds": 20.0,
+  "resolution": {
+    "width": 576,
+    "height": 1024
+  },
+  "fps": 24,
+  "frames": 480,
+  "sources": [
+    {
+      "role": "burger_review_character_source",
+      "path": "outputs/ltx23_orvo_round1_burger/ltx23_orvo_round1_burger_10s_i2v.mp4"
+    },
+    {
+      "role": "round_1_identity_bridge",
+      "path": "outputs/ltx23_orvo_03_i2v.mp4"
+    },
+    {
+      "role": "collage_insert_teal",
+      "path": "gbro-collage-broll/assets/demo-teal.gif"
+    },
+    {
+      "role": "collage_insert_yellow",
+      "path": "gbro-collage-broll/assets/demo-yellow.gif"
+    },
+    {
+      "role": "collage_insert_red",
+      "path": "gbro-collage-broll/assets/demo-red.gif"
+    },
+    {
+      "role": "collage_insert_purple",
+      "path": "gbro-collage-broll/assets/demo-purple.gif"
+    }
+  ],
+  "cost_usd_new": 0.0,
+  "paid_calls": {
+    "new_lora_training": false,
+    "new_ltx_render": false,
+    "videoclaw_gateway": false
+  },
+  "notes": [
+    "No secrets are stored in this manifest.",
+    "The proof uses existing round-1 LTX/Raindeer outputs and local ffmpeg composition.",
+    "The gbro assets are used as small editorial B-roll inserts, not as identity sources."
+  ]
+}

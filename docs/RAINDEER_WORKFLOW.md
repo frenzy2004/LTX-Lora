@@ -20,7 +20,7 @@ Raindeer is the repeatable LTX 2.3 character-LoRA loop that came out of the firs
 | 2 | 500 steps, about $3.00 | New reference footage with more source variation | [01 T2V](../results/videos/raindeer-round-2-01-t2v.mp4), [02 T2V](../results/videos/raindeer-round-2-02-t2v.mp4), [03 I2V](../results/videos/raindeer-round-2-03-i2v.mp4) | Mixed setting/outfit data made the result read more synthetic. |
 | 3 | 1000 steps, about $6.00 | Corridor-only subset, same outfit and lighting family | [01 T2V](../results/videos/raindeer-round-3-01-t2v.mp4), [02 T2V](../results/videos/raindeer-round-3-02-t2v.mp4), [03 I2V](../results/videos/raindeer-round-3-03-i2v.mp4) | Consistency matters more than dumping every available clip into training. |
 
-The twin, burger, and other prompt-only side quests are intentionally not part of the Raindeer proof set. They are useful render experiments, not training-round evidence.
+The twin, burger, and other prompt-only side quests are intentionally not part of the three-round training evidence. They are useful render experiments, not training-round evidence. The published burger review proof is tracked separately as a render-only round-1 reuse artifact in [RAINDEER_VIDEOCLAW_BURGER_REVIEW.md](RAINDEER_VIDEOCLAW_BURGER_REVIEW.md).
 
 ## Ledger Model
 

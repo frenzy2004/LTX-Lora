@@ -134,6 +134,18 @@
       }
     },
     {
+      "filename": "raindeer-videoclaw-round1-burger-review-20s.mp4",
+      "sha256": "49cca58d1db34e03961c82402a23126689f132ab024d207538ae5211e85e2e6b",
+      "bytes": 3229437,
+      "quality_status": "raindeer_round1_render_only_burger_review_proof",
+      "approval_date": "2026-07-24",
+      "manual_review": {
+        "output_classification": "generated_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
+    },
+    {
       "filename": "sync-v3-real-video-control.mp4",
       "sha256": "7af11bb61f1f1b475c6ab8b99fd7d32c7392bddf3e1f3e7252537db0dac156ff",
       "bytes": 16305156,
