@@ -146,6 +146,18 @@
       }
     },
     {
+      "filename": "raindeer-videoclaw-take2-20s.mp4",
+      "sha256": "20d84cef2b7a49ba264cf166e3c81c67f301046378ea362d44be4cc8c1a76a5f",
+      "bytes": 4770803,
+      "quality_status": "raindeer_identity_videoclaw_post_proof",
+      "approval_date": "2026-07-24",
+      "manual_review": {
+        "output_classification": "generated_output",
+        "consent_or_authorization": "confirmed",
+        "embedded_source_asset_metadata": false
+      }
+    },
+    {
       "filename": "sync-v3-real-video-control.mp4",
       "sha256": "7af11bb61f1f1b475c6ab8b99fd7d32c7392bddf3e1f3e7252537db0dac156ff",
       "bytes": 16305156,

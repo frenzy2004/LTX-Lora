@@ -110,6 +110,13 @@ APPROVED_PUBLIC_VIDEOS = {
         "approval_date": "2026-07-24",
         "output_classification": "generated_output",
     },
+    "raindeer-videoclaw-take2-20s.mp4": {
+        "bytes": 4_770_803,
+        "sha256": "20d84cef2b7a49ba264cf166e3c81c67f301046378ea362d44be4cc8c1a76a5f",
+        "quality_status": "raindeer_identity_videoclaw_post_proof",
+        "approval_date": "2026-07-24",
+        "output_classification": "generated_output",
+    },
     "t2v-lora-prompt-only-identity-failure.mp4": {
         "bytes": 2_332_942,
         "sha256": "4931530948986ea676496e63ca00838954deea5f92b1cabb6480365549498d35",
